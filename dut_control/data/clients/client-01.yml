@@ -1,0 +1,9 @@
+- name: client-01
+  key: fac72a9494cd132a
+  ssh:
+    - ip: 192.168.1.246
+    - port: 22
+    - user: psaavedra
+  ports-range:
+    - from: 5000
+    - to: 5010

@@ -1,0 +1,25 @@
+#! /bin/bash
+
+scripts=$(find . -executable -type f ! -path '*/\.*' -exec grep -lE '^#! *(|/usr/bin/env +|/bin/|/usr/bin/)(python|python3)' {} +)
+
+set -e
+
+fatal() {
+  echo "$@"
+  exit 1
+}
+
+echo "Running radon on the following scripts:"
+echo "$scripts"
+errors=0
+for script in $scripts; do
+
+  if radon cc -a -s -n C "$script" | grep -E "\- C|\- D|\- F"; then
+    echo "Complexity issue found!"
+    errors=$((errors + 1))
+  fi
+done
+if [ "$errors" -ne 0 ]; then
+  fatal "radon found issues."
+fi
+echo "radon passed successfully."

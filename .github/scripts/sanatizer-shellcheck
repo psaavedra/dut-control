@@ -1,0 +1,24 @@
+#! /bin/bash
+
+if [[ $# -eq 0 ]]; then
+  scripts=$(find . -executable -type f ! -path '*/\.*' -exec grep -lE '^#! *(|/usr/bin/env +|/bin/|/usr/bin/)(sh|bash|dash)' {} +)
+else
+  scripts="$@"
+fi
+
+set -e
+
+echo "Running ShellCheck on the following scripts:"
+echo "$scripts"
+errors=0
+
+for script in $scripts; do
+  if ! shellcheck -x "$script"; then
+    errors=$((errors + 1))
+  fi
+done
+if [ "$errors" -ne 0 ]; then
+  echo "ShellCheck found issues."
+  exit 1
+fi
+echo "ShellCheck passed successfully."

@@ -1,0 +1,19 @@
+name: Sanatizers
+
+on:
+  pull_request:
+    types: [synchronize, opened, reopened]
+
+jobs:
+  sanatizers:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+
+    - name: Install requirements
+      run: sudo apt-get install python3-flake8 python3-pycodestyle pycodestyle randon shellcheck which
+
+    - name: Run sanatizers
+      run: ./.github/scripts/run-all-sanatizers
+

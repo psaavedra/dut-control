@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dut-control"
+version = "0.1.0"
+description = "Flask-based DUT reservation and control service"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+authors = [
+  { name = "Pablo Saavedra", email = "psaavedra@igalia.com" }
+]
+
+dependencies = [
+  "flask>=2.3",
+  "pyyaml>=6.0",
+  "requests>=2.31",
+]
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Framework :: Flask",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/psaavedra/dut-control"
+Source = "https://github.com/psaavedra/dut-control.git"
+
+[project.scripts]
+dut-control = "dut_control.server:main"
+dut-control-client = "dut_control.client:main"
+dut-control-admin = "dut_control.admin:main"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools.package-data]
+"dut_control" = ["data/**/*.yml"]

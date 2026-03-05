@@ -1,0 +1,35 @@
+---
+- name: node-01
+  ssh:
+    - ip: 192.168.1.246
+    - port: 22
+    - user: runner
+  duts:
+    - name: rpi5-01
+      metadata:
+        - pool: rpi5
+      network:
+        - ip: 192.168.1.105
+        - ssh-port: 22
+      storage:
+        - driver: usbsdmux
+        - control: /dev/sg1
+        - device: /dev/sda1
+      power:
+        - driver: script
+        - power-on: /script.sh rpi5-01 on
+        - power-off: /script.sh rpi5-01 off
+    - name: rpi5-02
+      metadata:
+        - pool: rpi5
+      network:
+        - ip: 192.168.1.12
+        - ssh-port: 22
+      storage:
+        - driver: usbsdmux
+        - control: /dev/sg2
+        - device: /dev/sda2
+      power:
+        - driver: script
+        - power-on: /script.sh rpi5-02 on
+        - power-off: /script.sh rpi5-02 off

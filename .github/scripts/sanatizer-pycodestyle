@@ -1,0 +1,34 @@
+#! /bin/bash
+
+scripts=$(find . -type f ! -path '*/\.*' \( -executable -o -name '*.py' \) -exec grep -lE '^#! *(|/usr/bin/env +|/bin/|/usr/bin/)(python|python3)' {} +)
+
+set -e
+
+fatal() {
+  echo "$@"
+  exit 1
+}
+
+# Locate pycodestyle.
+for cmd in pycodestyle3 pycodestyle; do
+  if which "$cmd" 2>/dev/null; then
+    pycodestyle=$(which "$cmd")
+    break
+  fi
+done
+if [[ -z "$pycodestyle" ]]; then
+  fatal "Could not find pycodestyle"
+fi
+
+echo "Running pycodestyle on the following scripts:"
+echo "$scripts"
+errors=0
+for script in $scripts; do
+  if ! $pycodestyle "$script"; then
+    errors=$((errors + 1))
+  fi
+done
+if [ "$errors" -ne 0 ]; then
+  fatal "pycodestyle found issues."
+fi
+echo "pycodestyle passed successfully."
