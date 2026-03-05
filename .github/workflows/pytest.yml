@@ -37,6 +37,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e .[test]
 
+    - name: Create dut-control configuration directory
+      run: |
+        cp -a dut_control/data/ dut-control
+
     - name: Run pytest
       run: |
         pytest tests/ -v --tb=short
