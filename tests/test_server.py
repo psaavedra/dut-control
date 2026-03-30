@@ -230,7 +230,9 @@ def test_reserve_success(flask_client, monkeypatch):
     data = resp.get_json()
     assert data["status"] == 0
     assert "token" in data
+    assert "ip" in data
     assert "ssh-port" in data
+    assert "tunnel-ssh-port" in data
 
     # Reservation stored
     with server_mod.state_lock:
@@ -242,7 +244,7 @@ def test_reserve_success(flask_client, monkeypatch):
 
         # Tunnel started with same token / port
         assert started["token"] == data["token"]
-        assert started["remote_port"] == data["ssh-port"]
+        assert started["remote_port"] == data["tunnel-ssh-port"]
         assert len(server_mod.processes) == 1
 
 
