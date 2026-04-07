@@ -15,6 +15,16 @@ from flask import Flask, request, jsonify
 import yaml
 
 # ---------------------------------------------------------------------------
+# Global definitions
+# ---------------------------------------------------------------------------
+
+_SSH_SKIP_HOST_CHECK = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+]
+
+# ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 
@@ -339,9 +349,9 @@ def _start_ssh_tunnel(
 
     cmd = [
         "ssh",
+        *_SSH_SKIP_HOST_CHECK,
         "-N",
-        "-p",
-        str(client_ssh_port),
+        "-p", str(client_ssh_port),
         "-R",
         f"{remote_port}:{dut_ip}:{dut_ssh_port}",
         f"{user}@{client_ip}",
@@ -675,7 +685,9 @@ def _run_remote_power_script(node: dict, script: str):
     port = int(ssh.get("port", 22))
     user = ssh.get("user", "root")
 
-    cmd = ["ssh", "-p", str(port), f"{user}@{ip}", script]
+    cmd = ["ssh",
+           *_SSH_SKIP_HOST_CHECK,
+           "-p", str(port), f"{user}@{ip}", script]
     res = subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -759,6 +771,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         #    scp -P <client_port> user@client_ip:/remote/path /local/tmp/path
         scp_from_client = [
             "scp",
+            *_SSH_SKIP_HOST_CHECK,
             "-P",
             str(client_port),
             f"{client_user}@{client_ip}:{client_path}",
@@ -777,6 +790,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         #    scp -P <node_port> /local/tmp/path user@node_ip:/tmp/image.wic
         scp_to_node = [
             "scp",
+            *_SSH_SKIP_HOST_CHECK,
             "-P",
             str(node_port),
             local_tmp_path,
@@ -803,6 +817,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
 
         ssh_cmd = [
             "ssh",
+            *_SSH_SKIP_HOST_CHECK,
             "-p",
             str(node_port),
             f"{node_user}@{node_ip}",
