@@ -18,6 +18,8 @@ import yaml
 # Global definitions
 # ---------------------------------------------------------------------------
 
+_USBSDMUX_SETTLE_DELAY = 5
+
 _SSH_SKIP_HOST_CHECK = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
@@ -811,6 +813,8 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         #    usbsdmux <control> dut
         cmd = (
             f"usbsdmux {control} host && "
+            f"timeout {_USBSDMUX_SETTLE_DELAY} "
+            f"sh -c 'until [ -b {device} ]; do sleep 1; done' && "
             f"bmaptool copy --nobmap {node_tmp_path} {device} && "
             f"usbsdmux {control} dut"
         )
