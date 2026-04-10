@@ -813,8 +813,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         #    usbsdmux <control> dut
         cmd = (
             f"usbsdmux {control} host && "
-            f"timeout {_USBSDMUX_SETTLE_DELAY} "
-            f"sh -c 'until [ -b {device} ]; do sleep 1; done' && "
+            f"sleep {_USBSDMUX_SETTLE_DELAY} && "
             f"bmaptool copy --nobmap {node_tmp_path} {device} && "
             f"usbsdmux {control} dut"
         )
