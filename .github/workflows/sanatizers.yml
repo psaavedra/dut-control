@@ -13,7 +13,7 @@ jobs:
       uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
 
     - name: Install requirements
-      run: sudo apt-get install python3-flake8 python3-pycodestyle pycodestyle randon shellcheck which
+      run: sudo apt-get install python3-flake8 python3-pycodestyle pycodestyle radon shellcheck which
 
     - name: Run sanatizers
       run: ./.github/scripts/run-all-sanatizers
