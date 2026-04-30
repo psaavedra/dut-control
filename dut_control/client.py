@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import os
-import sys
-from typing import Any, Dict
-
+import re
 import requests
-
+import sys
+import time
+from typing import Any, Dict
 
 DEFAULT_BASE_URL = os.environ.get("DUT_CONTROL_URL", "http://localhost:8000")
 CLIENT_KEY_ENV = "DUT_CONTROL_CLIENT_KEY"
@@ -22,6 +22,43 @@ def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
     sys.exit(1)
 
 
+def _parse_duration(value: str) -> int:
+    s = value.strip().lower()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([a-z]+)", s)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration '{value}'; examples: 10s, 5m, 90minutes, 2h"
+        )
+
+    amount = float(m.group(1))
+    unit = m.group(2)
+
+    unit_seconds = {
+        "s": 1,
+        "sec": 1,
+        "secs": 1,
+        "second": 1,
+        "seconds": 1,
+        "m": 60,
+        "min": 60,
+        "mins": 60,
+        "minute": 60,
+        "minutes": 60,
+        "h": 3600,
+        "hr": 3600,
+        "hrs": 3600,
+        "hour": 3600,
+        "hours": 3600,
+    }
+
+    if unit not in unit_seconds:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration unit in '{value}'; use s, m, h, seconds, minutes, or hours"
+        )
+
+    return int(amount * unit_seconds[unit])
+
+
 def cmd_reserve(args: argparse.Namespace) -> None:
     client_key = os.environ.get(CLIENT_KEY_ENV)
     if not client_key:
@@ -34,22 +71,30 @@ def cmd_reserve(args: argparse.Namespace) -> None:
     base_url = args.url
     payload = {"client-key": client_key, "pool": args.pool}
 
-    resp = requests.post(
-        _full_url(base_url, "/reserve"),
-        json=payload,
-        timeout=args.timeout,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    retry_counter = 0
+    while True:
+        resp = requests.post(
+            _full_url(base_url, "/reserve"),
+            json=payload,
+            timeout=args.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
-    if data.get("status") != 0:
-        _print_error_and_exit("reserve failed", data)
+        if data.get("status") == 0:
+            print(f"token: {data['token']}")
+            print(f"ip: {data['ip']}")
+            print(f"ssh-port: {data['ssh-port']}")
+            print(f"tunnel-ssh-port: {data['tunnel-ssh-port']}")
+            return
 
-    print(f"token: {data['token']}")
-    print(f"ip: {data['ip']}")
-    print(f"ssh-port: {data['ssh-port']}")
-    print(f"tunnel-ssh-port: {data['tunnel-ssh-port']}")
+        retry_counter = retry_counter + 1
+        if retry_counter > args.retries:
+            break
 
+        time.sleep(args.retries_wait)
+
+    _print_error_and_exit("reserve failed", data)
 
 def cmd_lease(args: argparse.Namespace) -> None:
     client_key = os.environ.get(CLIENT_KEY_ENV)
@@ -174,6 +219,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp_reserve.add_argument(
         "pool",
         help="Pool name (metadata.pool in DUT config)",
+    )
+    sp_reserve.add_argument(
+        "--retries-wait",
+        type=_parse_duration,
+        default="60s",
+        help="Wait time between reserve retries, e.g. 10s, 5m, 1hour",
+    )
+    sp_reserve.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Retry attempts for reserve",
     )
     sp_reserve.set_defaults(func=cmd_reserve)
 
