@@ -581,3 +581,151 @@ def test_dut_status_ping_vs_ssh(flask_client, monkeypatch):
     resp = flask_client.post("/dut/status", json={"token": token})
     data = resp.get_json()
     assert data["status"] == "ping"
+
+
+# ---------------------------------------------------------------------------
+# DUT "enabled" metadata
+# ---------------------------------------------------------------------------
+
+def _write_node_yaml(nodes_dir, extra_metadata_lines=""):
+    nodes_dir.mkdir(exist_ok=True)
+    (nodes_dir / "node-01.yml").write_text(
+        f"""
+- name: node-01
+  ssh:
+    - ip: 192.0.2.1
+    - port: 22
+    - user: runner
+  duts:
+    - name: dut-01
+      metadata:
+        - pool: pool-01
+{extra_metadata_lines}
+      network:
+        - ip: 192.0.2.2
+        - ssh-port: 22
+"""
+    )
+
+
+def test_load_nodes_defaults_enabled_true(tmp_path):
+    _write_node_yaml(tmp_path / "nodes")
+
+    loaded = server_mod._load_nodes(tmp_path)
+    assert loaded[0]["duts"][0]["metadata"]["enabled"] is True
+
+
+def test_load_nodes_respects_explicit_enabled_false(tmp_path):
+    _write_node_yaml(tmp_path / "nodes", "        - enabled: false")
+
+    loaded = server_mod._load_nodes(tmp_path)
+    assert loaded[0]["duts"][0]["metadata"]["enabled"] is False
+
+
+def test_dut_enabled_defaults_true_when_missing():
+    dut = {"metadata": {"pool": "pool-01"}}
+    assert server_mod._dut_enabled(dut) is True
+
+
+def test_dut_enabled_respects_false():
+    dut = {"metadata": {"pool": "pool-01", "enabled": False}}
+    assert server_mod._dut_enabled(dut) is False
+
+
+def test_pool_exists_ignores_disabled_duts():
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["metadata"]["enabled"] = False
+
+    with server_mod.state_lock:
+        server_mod.nodes[:] = [node]
+
+    assert server_mod._pool_exists("pool-01") is False
+    assert server_mod._list_duts_in_pool("pool-01") == []
+
+
+def test_list_duts_in_pool_excludes_disabled_but_keeps_enabled():
+    node = {
+        "name": "node-01",
+        "ssh": {"ip": "192.0.2.20", "port": 22, "user": "runner"},
+        "duts": [
+            {
+                "name": "dut-enabled",
+                "metadata": {"pool": "pool-01", "enabled": True},
+                "network": {"ip": "192.0.2.30", "ssh-port": 22},
+                "storage": {},
+                "power": {},
+            },
+            {
+                "name": "dut-disabled",
+                "metadata": {"pool": "pool-01", "enabled": False},
+                "network": {"ip": "192.0.2.31", "ssh-port": 22},
+                "storage": {},
+                "power": {},
+            },
+        ],
+    }
+
+    with server_mod.state_lock:
+        server_mod.nodes[:] = [node]
+
+    result = server_mod._list_duts_in_pool("pool-01")
+    assert [dut["name"] for _, dut in result] == ["dut-enabled"]
+
+
+def test_reserve_skips_disabled_dut(flask_client, monkeypatch):
+    client = _make_client()
+    node = {
+        "name": "node-01",
+        "ssh": {"ip": "192.0.2.20", "port": 22, "user": "runner"},
+        "duts": [
+            {
+                "name": "dut-disabled",
+                "metadata": {"pool": "pool-01", "enabled": False},
+                "network": {"ip": "192.0.2.31", "ssh-port": 22},
+                "storage": {},
+                "power": {},
+            },
+            {
+                "name": "dut-enabled",
+                "metadata": {"pool": "pool-01", "enabled": True},
+                "network": {"ip": "192.0.2.30", "ssh-port": 22},
+                "storage": {},
+                "power": {},
+            },
+        ],
+    }
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    resp = flask_client.post(
+        "/reserve",
+        json={"client-key": client["key"], "pool": "pool-01"},
+    )
+    data = resp.get_json()
+    assert data["status"] == 0
+
+    with server_mod.state_lock:
+        assert server_mod.reserves[0]["dut-name"] == "dut-enabled"
+
+
+def test_reserve_fails_when_all_duts_in_pool_disabled(flask_client):
+    client = _make_client()
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["metadata"]["enabled"] = False
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    resp = flask_client.post(
+        "/reserve",
+        json={"client-key": client["key"], "pool": "pool-01"},
+    )
+    data = resp.get_json()
+    assert data["status"] == -2
+    assert "pool does not exist" in data["error"]
