@@ -507,6 +507,44 @@ def test_flash_success(flask_client, monkeypatch):
     assert called["args"][3] == "/remote/image.wic"
 
 
+def test_flash_image_uses_unique_node_tmp_path(monkeypatch):
+    """Two concurrent-ish flashes of the same file name must not share a
+    node temp path, so one cannot overwrite the other in flight."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    scp_to_node_targets = []
+    ssh_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "scp" and "@" in cmd[-1] and ":" in cmd[-1]:
+            scp_to_node_targets.append(cmd[-1].split(":", 1)[1])
+        elif cmd[0] == "ssh":
+            ssh_cmds.append(cmd[-1])
+        return server_mod.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    server_mod._flash_image(node, dut, client, "/remote/image.wic")
+    server_mod._flash_image(node, dut, client, "/remote/image.wic")
+
+    # Same source image name, but each call gets a distinct node tmp path
+    assert len(scp_to_node_targets) == 2
+    assert scp_to_node_targets[0] != scp_to_node_targets[1]
+
+    # bmaptool referenced the matching per-call path, and each was cleaned
+    # up afterwards
+    bmaptool_cmds = [c for c in ssh_cmds if "bmaptool" in c]
+    rm_cmds = [c for c in ssh_cmds if c.startswith("rm -f ")]
+    assert len(bmaptool_cmds) == 2
+    assert len(rm_cmds) == 2
+    for target, bmaptool_cmd, rm_cmd in zip(
+            scp_to_node_targets, bmaptool_cmds, rm_cmds):
+        assert target in bmaptool_cmd
+        assert rm_cmd == f"rm -f {target}"
+
+
 # ---------------------------------------------------------------------------
 # /dut/status endpoint
 # ---------------------------------------------------------------------------
