@@ -189,9 +189,11 @@ def _load_nodes(config_dir: Path):
             for dut in doc.get("duts", []):
                 if not isinstance(dut, dict):
                     continue
+                metadata = _normalize_section(dut.get("metadata", {}))
+                metadata.setdefault("enabled", True)
                 d = {
                     "name": dut["name"],
-                    "metadata": _normalize_section(dut.get("metadata", {})),
+                    "metadata": metadata,
                     "network": _normalize_section(dut.get("network", {})),
                     "storage": _normalize_section(dut.get("storage", {})),
                     "power": _normalize_section(dut.get("power", {})),
@@ -258,22 +260,29 @@ def _get_client_by_key(key: str):
     return None
 
 
+def _dut_enabled(dut: dict) -> bool:
+    return bool(dut.get("metadata", {}).get("enabled", True))
+
+
 def _pool_exists(pool: str) -> bool:
     with state_lock:
         for node in nodes:
             for dut in node.get("duts", []):
-                if dut.get("metadata", {}).get("pool") == pool:
+                if (dut.get("metadata", {}).get("pool") == pool
+                        and _dut_enabled(dut)):
                     return True
     return False
 
 
 def _list_duts_in_pool(pool: str):
-    """Return list of (node, dut) pairs for given pool."""
+    """Return list of (node, dut) pairs for given pool, excluding disabled
+    duts."""
     result = []
     with state_lock:
         for node in nodes:
             for dut in node.get("duts", []):
-                if dut.get("metadata", {}).get("pool") == pool:
+                if (dut.get("metadata", {}).get("pool") == pool
+                        and _dut_enabled(dut)):
                     result.append((node, dut))
     return result
 
