@@ -773,9 +773,15 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
     # Normalize basename once; we reuse it for local and remote tmp paths
     image_name = os.path.basename(client_path)
 
+    # tempfile.mkdtemp() guarantees a unique local directory per call, so
+    # local_tmp_path never collides across concurrent flashes. The node
+    # side has no such directory of its own, so reuse the same unique
+    # suffix to keep node_tmp_path collision-free when the same image name
+    # is flashed to the same node concurrently.
     tmpdir = tempfile.mkdtemp(prefix="dut-flash-")
+    unique_suffix = Path(tmpdir).name
     local_tmp_path = str(Path(tmpdir) / image_name)
-    node_tmp_path = f"/tmp/{image_name}"
+    node_tmp_path = f"/tmp/{unique_suffix}-{image_name}"
 
     try:
         # 1) scp from client -> local temp dir
@@ -856,6 +862,20 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         except OSError:
             # directory not empty or already removed; ignore
             pass
+
+        # Best-effort cleanup of the node temp file
+        subprocess.run(
+            [
+                "ssh",
+                *_SSH_SKIP_HOST_CHECK,
+                "-p", str(node_port),
+                f"{node_user}@{node_ip}",
+                f"rm -f {node_tmp_path}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
 
 
 @server.route("/flash", methods=["POST", "PUT"])
