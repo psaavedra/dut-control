@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import random
 import secrets
 import signal
 import socket
@@ -556,7 +557,7 @@ def reserve():
     if not available:
         return _error_response(-4, "all duts in use already")
 
-    node, dut = available[0]
+    node, dut = random.choice(available)
 
     # Early check: free port?
     free_port = _find_free_port_for_client(request.client)

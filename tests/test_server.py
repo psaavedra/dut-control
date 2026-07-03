@@ -286,6 +286,58 @@ def test_reserve_all_duts_in_use(flask_client, monkeypatch):
     assert fake_start_called is False
 
 
+def test_reserve_picks_random_dut_from_pool(flask_client, monkeypatch):
+    client = _make_client()
+    node = {
+        "name": "node-01",
+        "ssh": {"ip": "192.0.2.20", "port": 22, "user": "runner"},
+        "duts": [
+            {
+                "name": "dut-a",
+                "metadata": {"pool": "pool-01", "enabled": True},
+                "network": {"ip": "192.0.2.30", "ssh-port": 22},
+                "storage": {},
+                "power": {},
+            },
+            {
+                "name": "dut-b",
+                "metadata": {"pool": "pool-01", "enabled": True},
+                "network": {"ip": "192.0.2.31", "ssh-port": 22},
+                "storage": {},
+                "power": {},
+            },
+        ],
+    }
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    picked = {}
+
+    def fake_choice(seq):
+        picked["candidates"] = [dut["name"] for _, dut in seq]
+        return seq[1]  # deliberately not the first entry
+
+    monkeypatch.setattr(server_mod.random, "choice", fake_choice)
+
+    resp = flask_client.post(
+        "/reserve",
+        json={"client-key": client["key"], "pool": "pool-01"},
+    )
+    data = resp.get_json()
+    assert data["status"] == 0
+
+    # Selection went through random.choice() over all available DUTs...
+    assert sorted(picked["candidates"]) == ["dut-a", "dut-b"]
+    # ...and the reservation reflects whatever it returned, not always [0]
+    with server_mod.state_lock:
+        assert server_mod.reserves[0]["dut-name"] == "dut-b"
+
+
 def test_reserve_no_free_ports(flask_client, monkeypatch):
     client = _make_client(port_from=6000, port_to=6000)
     node, dut = _make_node_dut(pool="pool-01")
