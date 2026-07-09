@@ -742,6 +742,29 @@ def test_flash_image_raises_when_verification_fails(monkeypatch):
     assert any(c.startswith("rm -f ") for c in ssh_cmds)
 
 
+def test_flash_image_switch_back_failure_takes_precedence(monkeypatch):
+    """When verification and the mux switch-back both fail, the error
+    reports the stuck mux first (it needs operator action) but still
+    mentions the verification failure."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    def fake_run(cmd, **kwargs):
+        rc = 0
+        if cmd[0] == "ssh" and (
+                "sha256sum" in cmd[-1] or cmd[-1].endswith(" dut")):
+            rc = 1
+        return server_mod.subprocess.CompletedProcess(cmd, rc)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    with pytest.raises(
+            RuntimeError,
+            match="switch storage back to dut.*verification also failed"):
+        server_mod._flash_image(node, dut, client, "/remote/image.wic")
+
+
 # ---------------------------------------------------------------------------
 # /dut/status endpoint
 # ---------------------------------------------------------------------------
