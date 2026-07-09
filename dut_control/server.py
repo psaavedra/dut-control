@@ -722,7 +722,7 @@ def _switch_sd_card(node: dict, dut: dict, mode: str) -> bool:
     control = dut.get("storage", {}).get("control")
     if not control:
         return True
-    return _run_node_command(node, f"usbsdmux {control} {mode}")
+    return _run_node_command(node, f"usbsdmux {shlex.quote(control)} {mode}")
 
 
 @server.route("/power/<action>", methods=["POST", "PUT"])
@@ -790,7 +790,7 @@ def _flash_and_verify_on_node(
     to check it holds the image, and hand the card back to the DUT.
     """
     flash_cmd = (
-        f"usbsdmux {control} host && "
+        f"usbsdmux {shlex.quote(control)} host && "
         f"sleep {_USBSDMUX_SETTLE_DELAY} && "
         f"bmaptool copy --nobmap "
         f"{shlex.quote(node_tmp_path)} {shlex.quote(device)}"
@@ -803,7 +803,8 @@ def _flash_and_verify_on_node(
     # known state.
     verified = _run_node_command(
         node, _flash_verify_command(node_tmp_path, device))
-    switched = _run_node_command(node, f"usbsdmux {control} dut")
+    switched = _run_node_command(
+        node, f"usbsdmux {shlex.quote(control)} dut")
     if not verified:
         raise RuntimeError(
             "flash verification failed: device content does not match "
