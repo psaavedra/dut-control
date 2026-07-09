@@ -800,17 +800,20 @@ def _flash_and_verify_on_node(
 
     # Verify while the card is still attached to the node, then switch
     # the mux back to the DUT whatever the outcome so it is left in a
-    # known state.
+    # known state. A failed switch-back is reported ahead of a checksum
+    # mismatch: a mux stuck on host needs operator action first.
     verified = _run_node_command(
         node, _flash_verify_command(node_tmp_path, device))
     switched = _run_node_command(
         node, f"usbsdmux {shlex.quote(control)} dut")
+    if not switched:
+        detail = "" if verified else " (image verification also failed)"
+        raise RuntimeError(
+            "usbsdmux failed to switch storage back to dut" + detail)
     if not verified:
         raise RuntimeError(
             "flash verification failed: device content does not match "
             "the image")
-    if not switched:
-        raise RuntimeError("usbsdmux failed to switch storage back to dut")
 
 
 def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
