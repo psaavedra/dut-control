@@ -597,6 +597,61 @@ def test_flash_image_uses_unique_node_tmp_path(monkeypatch):
         assert rm_cmd == f"rm -f {target}"
 
 
+def test_flash_image_verifies_device_content(monkeypatch):
+    """After bmaptool, the device is read back and checksummed against
+    the image before the mux is handed back to the DUT."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    ssh_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "ssh":
+            ssh_cmds.append(cmd[-1])
+        return server_mod.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    server_mod._flash_image(node, dut, client, "/remote/image.wic")
+
+    verify_cmds = [c for c in ssh_cmds if "sha256sum" in c]
+    assert len(verify_cmds) == 1
+    assert "/dev/sda1" in verify_cmds[0]
+
+    # Verification happens between the flash and the switch back to dut
+    flash_idx = next(i for i, c in enumerate(ssh_cmds) if "bmaptool" in c)
+    verify_idx = ssh_cmds.index(verify_cmds[0])
+    dut_idx = ssh_cmds.index("usbsdmux /dev/sg1 dut")
+    assert flash_idx < verify_idx < dut_idx
+
+
+def test_flash_image_raises_when_verification_fails(monkeypatch):
+    """A checksum mismatch aborts the flash, but the mux is still handed
+    back to the DUT and the node temp file is cleaned up."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    ssh_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        rc = 0
+        if cmd[0] == "ssh":
+            ssh_cmds.append(cmd[-1])
+            if "sha256sum" in cmd[-1]:
+                rc = 1
+        return server_mod.subprocess.CompletedProcess(cmd, rc)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="verification failed"):
+        server_mod._flash_image(node, dut, client, "/remote/image.wic")
+
+    assert "usbsdmux /dev/sg1 dut" in ssh_cmds
+    assert any(c.startswith("rm -f ") for c in ssh_cmds)
+
+
 # ---------------------------------------------------------------------------
 # /dut/status endpoint
 # ---------------------------------------------------------------------------
