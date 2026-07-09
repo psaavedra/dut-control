@@ -3,6 +3,7 @@
 import os
 import random
 import secrets
+import shlex
 import signal
 import socket
 import subprocess
@@ -756,10 +757,12 @@ def _flash_verify_command(node_tmp_path: str, device: str) -> str:
     read back from the device. dd uses direct I/O so the bytes come from
     the medium, not from the page cache still warm from the write.
     """
+    image = shlex.quote(node_tmp_path)
+    dev = shlex.quote(device)
     return (
-        f"img_size=$(stat -c %s {node_tmp_path}) && "
-        f"img_sha=$(sha256sum {node_tmp_path} | awk '{{print $1}}') && "
-        f"dev_sha=$(dd if={device} iflag=direct bs=4M 2>/dev/null"
+        f"img_size=$(stat -c %s -- {image}) && "
+        f"img_sha=$(sha256sum -- {image} | awk '{{print $1}}') && "
+        f"dev_sha=$(dd if={dev} iflag=direct bs=4M 2>/dev/null"
         f' | head -c "$img_size" | sha256sum | awk \'{{print $1}}\') && '
         f'[ "$img_sha" = "$dev_sha" ]'
     )
@@ -774,7 +777,8 @@ def _flash_and_verify_on_node(
     flash_cmd = (
         f"usbsdmux {control} host && "
         f"sleep {_USBSDMUX_SETTLE_DELAY} && "
-        f"bmaptool copy --nobmap {node_tmp_path} {device}"
+        f"bmaptool copy --nobmap "
+        f"{shlex.quote(node_tmp_path)} {shlex.quote(device)}"
     )
     if not _run_node_command(node, flash_cmd):
         raise RuntimeError("flash command failed on node")
@@ -836,12 +840,14 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
     try:
         # 1) scp from client -> local temp dir
         #    scp -P <client_port> user@client_ip:/remote/path /local/tmp/path
+        #    Remote scp paths go through the remote shell, so quote the
+        #    request-provided path to keep it a single plain argument.
         scp_from_client = [
             "scp",
             *_SSH_SKIP_HOST_CHECK,
             "-P",
             str(client_port),
-            f"{client_user}@{client_ip}:{client_path}",
+            f"{client_user}@{client_ip}:{shlex.quote(client_path)}",
             local_tmp_path,
         ]
         res = subprocess.run(
@@ -861,7 +867,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
             "-P",
             str(node_port),
             local_tmp_path,
-            f"{node_user}@{node_ip}:{node_tmp_path}",
+            f"{node_user}@{node_ip}:{shlex.quote(node_tmp_path)}",
         ]
         res = subprocess.run(
             scp_to_node,
@@ -889,7 +895,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
             pass
 
         # Best-effort cleanup of the node temp file
-        _run_node_command(node, f"rm -f {node_tmp_path}")
+        _run_node_command(node, f"rm -f {shlex.quote(node_tmp_path)}")
 
 
 @server.route("/flash", methods=["POST", "PUT"])

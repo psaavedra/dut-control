@@ -597,6 +597,45 @@ def test_flash_image_uses_unique_node_tmp_path(monkeypatch):
         assert rm_cmd == f"rm -f {target}"
 
 
+def test_flash_image_quotes_awkward_image_names(monkeypatch):
+    """An image basename with spaces/metacharacters must reach the node
+    shell as one quoted argument, in scp, bmaptool, verify and rm."""
+    import shlex
+
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    scp_remote_specs = []
+    ssh_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "scp":
+            scp_remote_specs.extend(
+                a for a in cmd if "@" in a and ":" in a)
+        elif cmd[0] == "ssh":
+            ssh_cmds.append(cmd[-1])
+        return server_mod.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    server_mod._flash_image(node, dut, client, "/remote/im age;$(x).wic")
+
+    # scp remote paths are shell-quoted (client source and node target)
+    assert len(scp_remote_specs) == 2
+    for spec in scp_remote_specs:
+        assert spec.split(":", 1)[1].startswith("'")
+
+    # Every node command referencing the image uses the quoted tmp path
+    node_tmp = scp_remote_specs[1].split(":", 1)[1]
+    quoted = shlex.quote(shlex.split(node_tmp)[0])
+    assert quoted == node_tmp
+    for marker in ("bmaptool", "sha256sum", "rm -f"):
+        cmds = [c for c in ssh_cmds if marker in c]
+        assert cmds, f"no ssh command for {marker}"
+        assert all(quoted in c for c in cmds)
+
+
 def test_flash_image_verifies_device_content(monkeypatch):
     """After bmaptool, the device is read back and checksummed against
     the image before the mux is handed back to the DUT."""
