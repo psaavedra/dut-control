@@ -714,6 +714,17 @@ def _run_remote_power_script(node: dict, script: str):
     return _run_node_command(node, script)
 
 
+def _switch_sd_card(node: dict, dut: dict, mode: str) -> bool:
+    """
+    Point the DUT's SD card mux to `mode` (dut/host/off) via usbsdmux.
+    No-op success for DUTs without a storage mux configured.
+    """
+    control = dut.get("storage", {}).get("control")
+    if not control:
+        return True
+    return _run_node_command(node, f"usbsdmux {control} {mode}")
+
+
 @server.route("/power/<action>", methods=["POST", "PUT"])
 @validate_token
 def power(action):
@@ -731,9 +742,13 @@ def power(action):
 
     ok = True
     if action == "on":
-        ok = _run_remote_power_script(node, script_on)
+        # Hand the SD card back to the DUT and power it on
+        ok = (_run_remote_power_script(node, script_on)
+              and _switch_sd_card(node, dut, "dut"))
     elif action == "off":
-        ok = _run_remote_power_script(node, script_off)
+        # Power the DUT off and also cut power to the SD card
+        ok = (_run_remote_power_script(node, script_off)
+              and _switch_sd_card(node, dut, "off"))
     elif action == "cycle":
         ok = _run_remote_power_script(node, script_off)
         if ok:

@@ -276,6 +276,8 @@ On success, the service:
 - Locates the DUT and node associated with the reservation token
 - Reads power scripts from DUT configuration (`power-on` and `power-off`)
 - Runs these scripts on the node host over SSH
+- For `on`, additionally runs `usbsdmux <control> dut` on the node to hand the SD card back to the DUT, when the DUT has a `storage.control` configured
+- For `off`, additionally runs `usbsdmux <control> off` on the node to cut power to the SD card, when the DUT has a `storage.control` configured
 
 If the power script execution fails, the service returns `{"status": -99, "error": "power script failed"}`.
 

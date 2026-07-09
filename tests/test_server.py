@@ -495,6 +495,57 @@ def test_power_on_success(flask_client, monkeypatch):
     assert called["script"] == "echo on"
 
 
+def test_power_on_off_also_switch_sd_card(flask_client, monkeypatch):
+    """Power on/off run the power script and then point the SD mux to
+    dut/off when the DUT has one; DUTs without one skip the usbsdmux
+    call."""
+    client = _make_client()
+    node, dut = _make_node_dut(pool="pool-01")
+    token = "token-off"
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+        now = int(time.time())
+        server_mod.reserves.append(
+            {
+                "token": token,
+                "valid-from": now - 10,
+                "valid-until": now + 3600,
+                "client-key": client["key"],
+                "dut-name": dut["name"],
+            }
+        )
+        dut["power"] = {"power-on": "echo on", "power-off": "echo off"}
+        dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+
+    node_cmds = []
+
+    monkeypatch.setattr(
+        server_mod, "_run_remote_power_script", lambda n, s: True)
+    monkeypatch.setattr(
+        server_mod, "_run_node_command",
+        lambda n, c: node_cmds.append(c) or True)
+
+    resp = flask_client.post("/power/off", json={"token": token})
+    assert resp.get_json()["status"] == 0
+    assert node_cmds == ["usbsdmux /dev/sg1 off"]
+
+    node_cmds.clear()
+    resp = flask_client.post("/power/on", json={"token": token})
+    assert resp.get_json()["status"] == 0
+    assert node_cmds == ["usbsdmux /dev/sg1 dut"]
+
+    # Without a storage mux, no usbsdmux command is issued
+    node_cmds.clear()
+    with server_mod.state_lock:
+        dut["storage"] = {}
+    for action in ("on", "off"):
+        resp = flask_client.post(f"/power/{action}", json={"token": token})
+        assert resp.get_json()["status"] == 0
+    assert node_cmds == []
+
+
 # ---------------------------------------------------------------------------
 # /flash endpoint
 # ---------------------------------------------------------------------------
