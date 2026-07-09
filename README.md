@@ -279,7 +279,7 @@ On success, the service:
 - For `on`, additionally runs `usbsdmux <control> dut` on the node to hand the SD card back to the DUT, when the DUT has a `storage.control` configured
 - For `off`, additionally runs `usbsdmux <control> off` on the node to cut power to the SD card, when the DUT has a `storage.control` configured
 
-If the power script execution fails, the service returns `{"status": -99, "error": "power script failed"}`.
+If the power script execution fails, the service returns `{"status": -99, "error": "power script failed"}`. If the script succeeds but the SD mux switch fails, it returns `{"status": -99, "error": "usbsdmux switch to <dut|off> failed"}`.
 
 On success it returns `{"status": 0}`.
 

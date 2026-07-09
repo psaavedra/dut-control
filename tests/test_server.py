@@ -545,6 +545,15 @@ def test_power_on_off_also_switch_sd_card(flask_client, monkeypatch):
         assert resp.get_json()["status"] == 0
     assert node_cmds == []
 
+    # A mux switch failure is reported distinctly from a script failure
+    with server_mod.state_lock:
+        dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    monkeypatch.setattr(server_mod, "_run_node_command", lambda n, c: False)
+    resp = flask_client.post("/power/off", json={"token": token})
+    data = resp.get_json()
+    assert data["status"] == -99
+    assert data["error"] == "usbsdmux switch to off failed"
+
 
 # ---------------------------------------------------------------------------
 # /flash endpoint
