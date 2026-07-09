@@ -725,6 +725,30 @@ def _switch_sd_card(node: dict, dut: dict, mode: str) -> bool:
     return _run_node_command(node, f"usbsdmux {shlex.quote(control)} {mode}")
 
 
+def _power_action_error(action: str, node: dict, dut: dict):
+    """
+    Run the power action, returning an error message or None on success.
+    `on`/`off` also point the SD card mux to dut/off after the script.
+    """
+    power_info = dut.get("power", {})
+
+    if action == "cycle":
+        if not _run_remote_power_script(node, power_info.get("power-off")):
+            return "power script failed"
+        time.sleep(1)
+        if not _run_remote_power_script(node, power_info.get("power-on")):
+            return "power script failed"
+        return None
+
+    if not _run_remote_power_script(node, power_info.get(f"power-{action}")):
+        return "power script failed"
+
+    mux_mode = "dut" if action == "on" else "off"
+    if not _switch_sd_card(node, dut, mux_mode):
+        return f"usbsdmux switch to {mux_mode} failed"
+    return None
+
+
 @server.route("/power/<action>", methods=["POST", "PUT"])
 @validate_token
 def power(action):
@@ -736,27 +760,9 @@ def power(action):
     reserve_entry = _get_reserve_by_token(token)
     node, dut = _get_dut_and_node_by_name(reserve_entry["dut-name"])
 
-    power_info = dut.get("power", {})
-    script_on = power_info.get("power-on")
-    script_off = power_info.get("power-off")
-
-    ok = True
-    if action == "on":
-        # Hand the SD card back to the DUT and power it on
-        ok = (_run_remote_power_script(node, script_on)
-              and _switch_sd_card(node, dut, "dut"))
-    elif action == "off":
-        # Power the DUT off and also cut power to the SD card
-        ok = (_run_remote_power_script(node, script_off)
-              and _switch_sd_card(node, dut, "off"))
-    elif action == "cycle":
-        ok = _run_remote_power_script(node, script_off)
-        if ok:
-            time.sleep(1)
-            ok = _run_remote_power_script(node, script_on)
-
-    if not ok:
-        return jsonify({"status": -99, "error": "power script failed"}), 200
+    error = _power_action_error(action, node, dut)
+    if error:
+        return jsonify({"status": -99, "error": error}), 200
 
     return jsonify({"status": 0}), 200
 
