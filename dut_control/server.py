@@ -687,9 +687,9 @@ def lease():
 # /power/<on|off|cycle>
 # ---------------------------------------------------------------------------
 
-def _run_remote_power_script(node: dict, script: str):
+def _run_node_command(node: dict, command: str) -> bool:
     """
-    Minimal implementation using system ssh to run a remote script.
+    Run a shell command on a node over SSH; True when it exits 0.
     Assumes passwordless SSH (keys) from this service host to node.
     """
     ssh = node["ssh"]
@@ -699,7 +699,7 @@ def _run_remote_power_script(node: dict, script: str):
 
     cmd = ["ssh",
            *_SSH_SKIP_HOST_CHECK,
-           "-p", str(port), f"{user}@{ip}", script]
+           "-p", str(port), f"{user}@{ip}", command]
     res = subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -707,6 +707,10 @@ def _run_remote_power_script(node: dict, script: str):
         check=False,
     )
     return res.returncode == 0
+
+
+def _run_remote_power_script(node: dict, script: str):
+    return _run_node_command(node, script)
 
 
 @server.route("/power/<action>", methods=["POST", "PUT"])
@@ -745,11 +749,56 @@ def power(action):
 # /flash
 # ---------------------------------------------------------------------------
 
+def _flash_verify_command(node_tmp_path: str, device: str) -> str:
+    """
+    Shell command run on the node to check the device actually holds the
+    image: compare the image checksum against the same number of bytes
+    read back from the device. dd uses direct I/O so the bytes come from
+    the medium, not from the page cache still warm from the write.
+    """
+    return (
+        f"img_size=$(stat -c %s {node_tmp_path}) && "
+        f"img_sha=$(sha256sum {node_tmp_path} | awk '{{print $1}}') && "
+        f"dev_sha=$(dd if={device} iflag=direct bs=4M 2>/dev/null"
+        f' | head -c "$img_size" | sha256sum | awk \'{{print $1}}\') && '
+        f'[ "$img_sha" = "$dev_sha" ]'
+    )
+
+
+def _flash_and_verify_on_node(
+        node: dict, control: str, device: str, node_tmp_path: str):
+    """
+    Expose the SD card to the node, flash the image, read the device back
+    to check it holds the image, and hand the card back to the DUT.
+    """
+    flash_cmd = (
+        f"usbsdmux {control} host && "
+        f"sleep {_USBSDMUX_SETTLE_DELAY} && "
+        f"bmaptool copy --nobmap {node_tmp_path} {device}"
+    )
+    if not _run_node_command(node, flash_cmd):
+        raise RuntimeError("flash command failed on node")
+
+    # Verify while the card is still attached to the node, then switch
+    # the mux back to the DUT whatever the outcome so it is left in a
+    # known state.
+    verified = _run_node_command(
+        node, _flash_verify_command(node_tmp_path, device))
+    switched = _run_node_command(node, f"usbsdmux {control} dut")
+    if not verified:
+        raise RuntimeError(
+            "flash verification failed: device content does not match "
+            "the image")
+    if not switched:
+        raise RuntimeError("usbsdmux failed to switch storage back to dut")
+
+
 def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
     """
     1. scp image from client -> service temp dir
     2. scp image from service temp dir -> node temp dir
-    3. ssh to node and run usbsdmux/bmaptool commands using storage.* info
+    3. ssh to node: run usbsdmux/bmaptool using storage info, then read
+       the device back and compare checksums to confirm the flash took
 
     Requires passwordless SSH/SCP from the service host to both client and
     node.
@@ -823,33 +872,8 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         if res.returncode != 0:
             raise RuntimeError("scp to node failed")
 
-        # 3) ssh to node and run usbsdmux / bmaptool
-        #    usbsdmux <control> host
-        #    bmaptool copy --nobmap <node_tmp_path> <device>
-        #    usbsdmux <control> dut
-        cmd = (
-            f"usbsdmux {control} host && "
-            f"sleep {_USBSDMUX_SETTLE_DELAY} && "
-            f"bmaptool copy --nobmap {node_tmp_path} {device} && "
-            f"usbsdmux {control} dut"
-        )
-
-        ssh_cmd = [
-            "ssh",
-            *_SSH_SKIP_HOST_CHECK,
-            "-p",
-            str(node_port),
-            f"{node_user}@{node_ip}",
-            cmd,
-        ]
-        res = subprocess.run(
-            ssh_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if res.returncode != 0:
-            raise RuntimeError("flash command failed on node")
+        # 3) ssh to node: flash, verify device content, hand back to DUT
+        _flash_and_verify_on_node(node, control, device, node_tmp_path)
 
     finally:
         # Best-effort cleanup of local temp file/dir
@@ -865,18 +889,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
             pass
 
         # Best-effort cleanup of the node temp file
-        subprocess.run(
-            [
-                "ssh",
-                *_SSH_SKIP_HOST_CHECK,
-                "-p", str(node_port),
-                f"{node_user}@{node_ip}",
-                f"rm -f {node_tmp_path}",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        _run_node_command(node, f"rm -f {node_tmp_path}")
 
 
 @server.route("/flash", methods=["POST", "PUT"])

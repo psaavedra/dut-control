@@ -298,7 +298,8 @@ The service performs the following steps:
 3. On the node, runs:
    - `usbsdmux <control> host`
    - `bmaptool copy --nobmap <image> <device>`
-   - `usbsdmux <control> dut`
+4. Verifies the flash on the node by reading back the first image-size bytes of the device (direct I/O, bypassing the page cache) and comparing their SHA-256 checksum against the image's
+5. Runs `usbsdmux <control> dut` on the node to hand the storage back to the DUT (this happens even if verification fails, so the mux is left in a known state)
 
 Storage parameters (`control` and `device`) are read from the DUT `storage` configuration.
 
@@ -307,6 +308,7 @@ Storage parameters (`control` and `device`) are read from the DUT `storage` conf
 - Missing `path`: `{"status": -99, "error": "path missing"}`
 - Missing client or DUT in configuration: `{"status": -99, "error": "client not found"|"dut not found"}`
 - Flash pipeline failure: `{"status": -99, "error": "flash failed: ..."}`
+- Verification mismatch: `{"status": -99, "error": "flash failed: flash verification failed: ..."}`
 - Success: `{"status": 0}`
 
 ### DUT status: /dut/status
