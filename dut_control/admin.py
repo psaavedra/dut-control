@@ -102,6 +102,21 @@ def cmd_prune(args: argparse.Namespace) -> None:
     _print_json(data)
 
 
+def cmd_dut_enabled(args: argparse.Namespace) -> None:
+    key = _get_admin_key()
+    base_url = args.url
+    payload = {
+        "admin-key": key,
+        "dut-name": args.dut_name,
+        "enabled": args.enabled,
+    }
+    resp = _post_json(base_url, "/conf/dut/enabled", payload, args.timeout)
+    data = resp.json()
+    _print_json(data)
+    if data.get("result") != 0:
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Argparse / entry point
 # ---------------------------------------------------------------------------
@@ -155,6 +170,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prune expired reservation entries",
     )
     sp_prune.set_defaults(func=cmd_prune)
+
+    sp_dut_enable = sub.add_parser(
+        "dut-enable",
+        help="Enable a DUT so it can be reserved again",
+    )
+    sp_dut_enable.add_argument("dut_name", help="DUT name")
+    sp_dut_enable.set_defaults(func=cmd_dut_enabled, enabled=True)
+
+    sp_dut_disable = sub.add_parser(
+        "dut-disable",
+        help="Disable a DUT to exclude it from pools and new reservations",
+    )
+    sp_dut_disable.add_argument("dut_name", help="DUT name")
+    sp_dut_disable.set_defaults(func=cmd_dut_enabled, enabled=False)
 
     return p
 

@@ -526,6 +526,36 @@ def conf_reserves_prune():
     return jsonify({"result": 0, "pruned": before - after})
 
 
+@server.route("/conf/dut/enabled", methods=["POST", "PUT"])
+def conf_dut_enabled():
+    """
+    Enable/disable a DUT at runtime. Disabled DUTs are excluded from pool
+    lookups (so they cannot be reserved) but existing reservations keep
+    working. The change lives in memory only: /conf/reload or a restart
+    reverts to the YAML value.
+    """
+    body = request.get_json(silent=True) or {}
+    if not _check_admin_key_from_body(body):
+        return jsonify({"error": "invalid admin-key"}), 403
+
+    dut_name = body.get("dut-name")
+    if not dut_name:
+        return jsonify({"result": -1, "error": "dut-name missing"}), 200
+
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify(
+            {"result": -1, "error": "enabled must be a boolean"}), 200
+
+    with state_lock:
+        node, dut = _get_dut_and_node_by_name(dut_name)
+        if not dut:
+            return jsonify({"result": -2, "error": "dut not found"}), 200
+        dut.setdefault("metadata", {})["enabled"] = enabled
+
+    return jsonify({"result": 0, "dut-name": dut_name, "enabled": enabled})
+
+
 # ---------------------------------------------------------------------------
 # /reserve
 # ---------------------------------------------------------------------------
