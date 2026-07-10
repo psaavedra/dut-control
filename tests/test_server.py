@@ -809,6 +809,39 @@ def test_flash_image_switch_back_failure_takes_precedence(monkeypatch):
         server_mod._flash_image(node, dut, client, "/remote/image.wic")
 
 
+def test_flash_node_step_failure_disables_dut(monkeypatch):
+    """A node-side flash failure (step 3) disables the DUT so it drops
+    out of pool lookups; a client-side scp failure does not."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    def fail_bmaptool(cmd, **kwargs):
+        rc = 1 if cmd[0] == "ssh" and "bmaptool" in cmd[-1] else 0
+        return server_mod.subprocess.CompletedProcess(cmd, rc)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fail_bmaptool)
+    with pytest.raises(RuntimeError, match="flash command failed"):
+        server_mod._flash_image(node, dut, client, "/remote/image.wic")
+    assert dut["metadata"]["enabled"] is False
+    assert server_mod._list_duts_in_pool("pool-01") == []
+
+    dut["metadata"]["enabled"] = True
+
+    def fail_scp(cmd, **kwargs):
+        rc = 1 if cmd[0] == "scp" else 0
+        return server_mod.subprocess.CompletedProcess(cmd, rc)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fail_scp)
+    with pytest.raises(RuntimeError, match="scp from client failed"):
+        server_mod._flash_image(node, dut, client, "/remote/image.wic")
+    assert dut["metadata"]["enabled"] is True
+
+
 # ---------------------------------------------------------------------------
 # /dut/status endpoint
 # ---------------------------------------------------------------------------

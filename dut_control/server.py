@@ -933,8 +933,16 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         if res.returncode != 0:
             raise RuntimeError("scp to node failed")
 
-        # 3) ssh to node: flash, verify device content, hand back to DUT
-        _flash_and_verify_on_node(node, control, device, node_tmp_path)
+        # 3) ssh to node: flash, verify device content, hand back to DUT.
+        #    A failure here points at a bad card/mux on this DUT, so take
+        #    it out of rotation; an operator can re-enable it via
+        #    /conf/dut/enabled or a config reload.
+        try:
+            _flash_and_verify_on_node(node, control, device, node_tmp_path)
+        except Exception:
+            with state_lock:
+                dut.setdefault("metadata", {})["enabled"] = False
+            raise
 
     finally:
         # Best-effort cleanup of local temp file/dir
