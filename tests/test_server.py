@@ -619,6 +619,41 @@ def test_flash_success(flask_client, monkeypatch):
     assert called["args"][3] == "/remote/image.wic"
 
 
+def test_flash_error_is_not_double_prefixed(flask_client, monkeypatch):
+    """The endpoint returns the pipeline error verbatim; the CLI adds its
+    own "flash failed" prefix, so the server must not add one too."""
+    client = _make_client()
+    node, dut = _make_node_dut(pool="pool-01")
+    token = "token-flash-err"
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+        now = int(time.time())
+        server_mod.reserves.append(
+            {
+                "token": token,
+                "valid-from": now - 10,
+                "valid-until": now + 3600,
+                "client-key": client["key"],
+                "dut-name": dut["name"],
+            }
+        )
+
+    def fake_flash_image(node_arg, dut_arg, client_arg, client_path):
+        raise RuntimeError("flash command failed on node")
+
+    monkeypatch.setattr(server_mod, "_flash_image", fake_flash_image)
+
+    resp = flask_client.post(
+        "/flash",
+        json={"token": token, "path": "/remote/image.wic"},
+    )
+    data = resp.get_json()
+    assert data["status"] == -99
+    assert data["error"] == "flash command failed on node"
+
+
 def test_flash_image_uses_unique_node_tmp_path(monkeypatch):
     """Two concurrent-ish flashes of the same file name must not share a
     node temp path, so one cannot overwrite the other in flight."""
