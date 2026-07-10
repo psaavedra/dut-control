@@ -313,6 +313,8 @@ Storage parameters (`control` and `device`) are read from the DUT `storage` conf
 - Verification mismatch: `{"status": -99, "error": "flash verification failed: ..."}`
 - Success: `{"status": 0}`
 
+If the node-side step (3-5) fails; the flash command, the verification, or the mux switch-back; the service additionally marks the DUT as disabled (`metadata.enabled: false`), excluding it from new reservations; such a failure usually means a bad SD card or mux on that DUT. Existing reservations keep working. Re-enable it with `dut-control-admin dut-enable <dut-name>` (or `/conf/reload`) once fixed. Failures copying the image from the client (steps 1-2) do not disable the DUT.
+
 ### DUT status: /dut/status
 
 Check simple reachability status for the DUT associated with a reservation.
