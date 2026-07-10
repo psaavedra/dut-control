@@ -309,8 +309,8 @@ Storage parameters (`control` and `device`) are read from the DUT `storage` conf
 
 - Missing `path`: `{"status": -99, "error": "path missing"}`
 - Missing client or DUT in configuration: `{"status": -99, "error": "client not found"|"dut not found"}`
-- Flash pipeline failure: `{"status": -99, "error": "flash failed: ..."}`
-- Verification mismatch: `{"status": -99, "error": "flash failed: flash verification failed: ..."}`
+- Flash pipeline failure: `{"status": -99, "error": "..."}` (e.g. `"scp from client failed"`, `"flash command failed on node"`)
+- Verification mismatch: `{"status": -99, "error": "flash verification failed: ..."}`
 - Success: `{"status": 0}`
 
 ### DUT status: /dut/status

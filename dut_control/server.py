@@ -946,7 +946,7 @@ def flash():
     try:
         _flash_image(node, dut, client, path)
     except Exception as e:
-        return jsonify({"status": -99, "error": f"flash failed: {e}"}), 200
+        return jsonify({"status": -99, "error": str(e)}), 200
 
     return jsonify({"status": 0}), 200
 
