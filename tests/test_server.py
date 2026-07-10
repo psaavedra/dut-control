@@ -1015,6 +1015,69 @@ def test_reserve_skips_disabled_dut(flask_client, monkeypatch):
         assert server_mod.reserves[0]["dut-name"] == "dut-enabled"
 
 
+def test_conf_dut_enabled_toggles_dut(flask_client, monkeypatch):
+    """/conf/dut/enabled disables/enables a DUT at runtime, controlling
+    whether pool lookups (and therefore /reserve) can see it."""
+    client = _make_client()
+    node, dut = _make_node_dut(pool="pool-01")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+    monkeypatch.setattr(server_mod, "admin_key", "test-admin-key")
+
+    # Wrong admin key -> HTTP 403
+    resp = flask_client.post(
+        "/conf/dut/enabled",
+        json={"admin-key": "bad", "dut-name": dut["name"],
+              "enabled": False},
+    )
+    assert resp.status_code == 403
+
+    # Unknown DUT -> result -2
+    resp = flask_client.post(
+        "/conf/dut/enabled",
+        json={"admin-key": "test-admin-key", "dut-name": "no-such-dut",
+              "enabled": False},
+    )
+    assert resp.get_json()["result"] == -2
+
+    # Non-boolean enabled -> result -1
+    resp = flask_client.post(
+        "/conf/dut/enabled",
+        json={"admin-key": "test-admin-key", "dut-name": dut["name"],
+              "enabled": "false"},
+    )
+    assert resp.get_json()["result"] == -1
+
+    # Disable: the only DUT in the pool vanishes, so /reserve fails
+    resp = flask_client.post(
+        "/conf/dut/enabled",
+        json={"admin-key": "test-admin-key", "dut-name": dut["name"],
+              "enabled": False},
+    )
+    data = resp.get_json()
+    assert data == {"result": 0, "dut-name": dut["name"], "enabled": False}
+
+    resp = flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": "pool-01"})
+    assert resp.get_json()["status"] == -2
+
+    # Re-enable: reservable again
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+    resp = flask_client.post(
+        "/conf/dut/enabled",
+        json={"admin-key": "test-admin-key", "dut-name": dut["name"],
+              "enabled": True},
+    )
+    assert resp.get_json()["result"] == 0
+
+    resp = flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": "pool-01"})
+    assert resp.get_json()["status"] == 0
+
+
 def test_reserve_fails_when_all_duts_in_pool_disabled(flask_client):
     client = _make_client()
     node, dut = _make_node_dut(pool="pool-01")

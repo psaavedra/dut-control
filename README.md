@@ -356,6 +356,10 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 - **`POST /conf/reserves/prune`**
   Prunes expired reservations and returns `{"result": 0, "pruned": <n>}`
 
+- **`POST /conf/dut/enabled`**
+  Enables or disables a DUT at runtime. Body: `dut-name` (string, required) and `enabled` (boolean, required), plus `admin-key`. Returns `{"result": 0, "dut-name": ..., "enabled": ...}` on success, `{"result": -1, "error": ...}` for a missing `dut-name` or non-boolean `enabled`, and `{"result": -2, "error": "dut not found"}` for an unknown DUT.
+  Disabled DUTs are excluded from pool lookups so they cannot be reserved; existing reservations keep working. The change is in-memory only: `/conf/reload` or a service restart reverts to the `enabled` value from the YAML configuration.
+
 ## CLI tools
 
 ### dut-control-client
@@ -445,6 +449,9 @@ dut-control-client status "$TOKEN"
 - **`prune`**
   Calls `/conf/reserves/prune` and prints how many reservations were pruned
 
+- **`dut-enable <dut-name>`** / **`dut-disable <dut-name>`**
+  Calls `/conf/dut/enabled` to enable or disable a DUT at runtime and prints the JSON response; exits with status 1 if the service reports an error (e.g. unknown DUT). The change lasts until the next `reload` or service restart.
+
 **Example**:
 
 ```bash
@@ -459,6 +466,10 @@ dut-control-admin nodes
 
 # Prune expired reservations
 dut-control-admin prune
+
+# Take a misbehaving DUT out of rotation, then bring it back
+dut-control-admin dut-disable rpi5-03
+dut-control-admin dut-enable rpi5-03
 ```
 
 ## Testing
