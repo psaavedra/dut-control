@@ -786,6 +786,29 @@ def test_flash_image_raises_when_verification_fails(monkeypatch):
     assert any(c.startswith("rm -f ") for c in ssh_cmds)
 
 
+def test_flash_verify_command_checksums_decompressed_stream():
+    """bmaptool decompresses compressed images while writing, so the
+    verify command must size and checksum the decompressed bytes, not
+    the compressed file (which would never match the device)."""
+    cmd = server_mod._flash_verify_command(
+        "/tmp/dut-flash-x-core-image.wic.bz2", "/dev/sda1")
+    assert cmd.count("bzip2 -dc") == 2  # one pass for size, one for sha
+    assert "wc -c" in cmd
+    assert "stat -c" not in cmd
+
+    # Compressed tarballs are unpacked to the contained image stream
+    cmd = server_mod._flash_verify_command(
+        "/tmp/dut-flash-x-rootfs.tar.xz", "/dev/sda1")
+    assert "xz -dc" in cmd
+    assert "tar -xO" in cmd
+
+    # Raw images keep the cheap stat/sha256sum on the file itself
+    cmd = server_mod._flash_verify_command(
+        "/tmp/dut-flash-x-core-image.wic", "/dev/sda1")
+    assert "stat -c %s" in cmd
+    assert " -dc" not in cmd
+
+
 def test_flash_image_switch_back_failure_takes_precedence(monkeypatch):
     """When verification and the mux switch-back both fail, the error
     reports the stuck mux first (it needs operator action) but still
