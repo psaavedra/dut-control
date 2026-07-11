@@ -801,18 +801,57 @@ def power(action):
 # /flash
 # ---------------------------------------------------------------------------
 
+# Compressed image formats bmaptool transparently unpacks while writing;
+# verification must checksum the same decompressed stream, not the file.
+_IMAGE_DECOMPRESSORS = {
+    ".gz": "gzip -dc",
+    ".bz2": "bzip2 -dc",
+    ".xz": "xz -dc",
+    ".zst": "zstd -dc",
+    ".lz4": "lz4 -dc",
+    ".lzo": "lzop -dc",
+}
+
+
+def _image_stream_command(node_tmp_path: str):
+    """
+    Shell command writing the raw image bytes to stdout, or None when
+    the file is already a raw image. Covers the compressed (and
+    compressed tar) formats bmaptool decompresses on the fly.
+    """
+    image = shlex.quote(node_tmp_path)
+    name = node_tmp_path.lower()
+    for ext, tool in _IMAGE_DECOMPRESSORS.items():
+        if name.endswith(ext):
+            stream = f"{tool} < {image}"
+            if name.endswith(".tar" + ext):
+                stream += " | tar -xO"
+            return stream
+    return None
+
+
 def _flash_verify_command(node_tmp_path: str, device: str) -> str:
     """
     Shell command run on the node to check the device actually holds the
     image: compare the image checksum against the same number of bytes
-    read back from the device. dd uses direct I/O so the bytes come from
-    the medium, not from the page cache still warm from the write.
+    read back from the device. Compressed images are checksummed over
+    their decompressed stream (decompressing twice: size, then hash),
+    since that is what bmaptool writes. dd uses direct I/O so the bytes
+    come from the medium, not from the page cache still warm from the
+    write.
     """
     image = shlex.quote(node_tmp_path)
     dev = shlex.quote(device)
+    stream = _image_stream_command(node_tmp_path)
+    if stream:
+        size_cmd = f"{stream} | wc -c"
+        sha_cmd = f"{stream} | sha256sum"
+    else:
+        size_cmd = f"stat -c %s -- {image}"
+        sha_cmd = f"sha256sum -- {image}"
     return (
-        f"img_size=$(stat -c %s -- {image}) && "
-        f"img_sha=$(sha256sum -- {image} | awk '{{print $1}}') && "
+        f"img_size=$({size_cmd}) && "
+        f"img_sha=$({sha_cmd} | awk '{{print $1}}') && "
         f"dev_sha=$(dd if={dev} iflag=direct bs=4M 2>/dev/null"
         f' | head -c "$img_size" | sha256sum | awk \'{{print $1}}\') && '
         f'[ "$img_sha" = "$dev_sha" ]'
