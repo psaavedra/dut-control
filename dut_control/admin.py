@@ -84,8 +84,11 @@ def cmd_processes(args: argparse.Namespace) -> None:
 def cmd_reserves(args: argparse.Namespace) -> None:
     key = _get_admin_key()
     base_url = args.url
+    payload: Dict[str, Any] = {"admin-key": key}
+    if args.active:
+        payload["active"] = True
     resp = _post_json(
-        base_url, "/conf/info/reserves", {"admin-key": key}, args.timeout
+        base_url, "/conf/info/reserves", payload, args.timeout
     )
     data = resp.json()
     _print_json(data)
@@ -162,6 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp_reserves = sub.add_parser(
         "reserves",
         help="Show current reservation entries",
+    )
+    sp_reserves.add_argument(
+        "-a",
+        "--active",
+        action="store_true",
+        help="Show only currently valid reservations "
+             "(valid-from <= now <= valid-until)",
     )
     sp_reserves.set_defaults(func=cmd_reserves)
 

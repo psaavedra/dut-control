@@ -1071,6 +1071,32 @@ def test_reserve_skips_disabled_dut(flask_client, monkeypatch):
         assert server_mod.reserves[0]["dut-name"] == "dut-enabled"
 
 
+def test_conf_info_reserves_active_filter(flask_client, monkeypatch):
+    """With "active": true, /conf/info/reserves returns only entries
+    where valid-from <= now <= valid-until."""
+    monkeypatch.setattr(server_mod, "admin_key", "test-admin-key")
+    now = int(time.time())
+    with server_mod.state_lock:
+        server_mod.reserves[:] = [
+            {"token": "expired", "valid-from": now - 100,
+             "valid-until": now - 10, "client-key": "k", "dut-name": "d1"},
+            {"token": "active", "valid-from": now - 10,
+             "valid-until": now + 100, "client-key": "k", "dut-name": "d2"},
+            {"token": "future", "valid-from": now + 50,
+             "valid-until": now + 100, "client-key": "k", "dut-name": "d3"},
+        ]
+
+    resp = flask_client.post(
+        "/conf/info/reserves", json={"admin-key": "test-admin-key"})
+    tokens = {r["token"] for r in resp.get_json()}
+    assert tokens == {"expired", "active", "future"}
+
+    resp = flask_client.post(
+        "/conf/info/reserves",
+        json={"admin-key": "test-admin-key", "active": True})
+    assert [r["token"] for r in resp.get_json()] == ["active"]
+
+
 def test_conf_dut_enabled_toggles_dut(flask_client, monkeypatch):
     """/conf/dut/enabled disables/enables a DUT at runtime, controlling
     whether pool lookups (and therefore /reserve) can see it."""

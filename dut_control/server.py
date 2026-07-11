@@ -508,7 +508,16 @@ def conf_info_reserves():
         return jsonify({"error": "invalid admin-key"}), 403
 
     with state_lock:
-        return jsonify(reserves)
+        result = list(reserves)
+
+    if body.get("active"):
+        now = _now_epoch()
+        result = [
+            r for r in result
+            if r.get("valid-from", 0) <= now <= r.get("valid-until", 0)
+        ]
+
+    return jsonify(result)
 
 
 @server.route("/conf/reserves/prune", methods=["POST", "PUT"])

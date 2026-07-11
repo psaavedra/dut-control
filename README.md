@@ -353,7 +353,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   Returns tracked SSH tunnel processes (pid, reserve token, command, client name, ports in use)
 
 - **`POST /conf/info/reserves`**
-  Returns current reservation entries
+  Returns current reservation entries. With `"active": true` in the body, returns only currently valid entries (`valid-from <= now <= valid-until`)
 
 - **`POST /conf/reserves/prune`**
   Prunes expired reservations and returns `{"result": 0, "pruned": <n>}`
@@ -445,8 +445,8 @@ dut-control-client status "$TOKEN"
 - **`processes`**
   Calls `/conf/info/processes` and prints active SSH tunnel processes
 
-- **`reserves`**
-  Calls `/conf/info/reserves` and prints current reservations
+- **`reserves [-a|--active]`**
+  Calls `/conf/info/reserves` and prints current reservations; with `--active`, only currently valid ones (`valid-from <= now <= valid-until`)
 
 - **`prune`**
   Calls `/conf/reserves/prune` and prints how many reservations were pruned
