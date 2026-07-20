@@ -305,6 +305,8 @@ The service performs the following steps:
 
 Storage parameters (`control` and `device`) are read from the DUT `storage` configuration.
 
+Step 3-5 (the node-side flash/verify/switch-back) is serialized per node: if two `/flash` requests target DUTs on the same node at the same time, the second request blocks until the first one finishes instead of racing it on the node's usbsdmux/bmaptool. Flashes to different nodes still run concurrently.
+
 **Responses**:
 
 - Missing `path`: `{"status": -99, "error": "path missing"}`

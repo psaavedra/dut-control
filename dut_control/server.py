@@ -867,37 +867,61 @@ def _flash_verify_command(node_tmp_path: str, device: str) -> str:
     )
 
 
+# Serializes _flash_and_verify_on_node per node name: usbsdmux/bmaptool
+# operate on physical storage shared by all DUTs of a node, so a second
+# flash for the same node waits for the first to finish instead of
+# racing it. Keyed by name (not the node dict) so the lock survives a
+# /conf/reload, which replaces node dicts wholesale.
+_node_flash_locks: dict = {}
+_node_flash_locks_guard = threading.Lock()
+
+
+def _get_node_flash_lock(node_name: str):
+    """Return the flash lock for a node name, creating it on first use."""
+    with _node_flash_locks_guard:
+        lock = _node_flash_locks.get(node_name)
+        if lock is None:
+            lock = threading.Lock()
+            _node_flash_locks[node_name] = lock
+        return lock
+
+
 def _flash_and_verify_on_node(
         node: dict, control: str, device: str, node_tmp_path: str):
     """
     Expose the SD card to the node, flash the image, read the device back
     to check it holds the image, and hand the card back to the DUT.
-    """
-    flash_cmd = (
-        f"usbsdmux {shlex.quote(control)} host && "
-        f"sleep {_USBSDMUX_SETTLE_DELAY} && "
-        f"bmaptool copy --nobmap "
-        f"{shlex.quote(node_tmp_path)} {shlex.quote(device)}"
-    )
-    if not _run_node_command(node, flash_cmd):
-        raise RuntimeError("flash command failed on node")
 
-    # Verify while the card is still attached to the node, then switch
-    # the mux back to the DUT whatever the outcome so it is left in a
-    # known state. A failed switch-back is reported ahead of a checksum
-    # mismatch: a mux stuck on host needs operator action first.
-    verified = _run_node_command(
-        node, _flash_verify_command(node_tmp_path, device))
-    switched = _run_node_command(
-        node, f"usbsdmux {shlex.quote(control)} dut")
-    if not switched:
-        detail = "" if verified else " (image verification also failed)"
-        raise RuntimeError(
-            "usbsdmux failed to switch storage back to dut" + detail)
-    if not verified:
-        raise RuntimeError(
-            "flash verification failed: device content does not match "
-            "the image")
+    Only one call runs per node at a time; a concurrent call for the
+    same node blocks here until the in-progress one finishes.
+    """
+    with _get_node_flash_lock(node["name"]):
+        flash_cmd = (
+            f"usbsdmux {shlex.quote(control)} host && "
+            f"sleep {_USBSDMUX_SETTLE_DELAY} && "
+            f"bmaptool copy --nobmap "
+            f"{shlex.quote(node_tmp_path)} {shlex.quote(device)}"
+        )
+        if not _run_node_command(node, flash_cmd):
+            raise RuntimeError("flash command failed on node")
+
+        # Verify while the card is still attached to the node, then
+        # switch the mux back to the DUT whatever the outcome so it is
+        # left in a known state. A failed switch-back is reported ahead
+        # of a checksum mismatch: a mux stuck on host needs operator
+        # action first.
+        verified = _run_node_command(
+            node, _flash_verify_command(node_tmp_path, device))
+        switched = _run_node_command(
+            node, f"usbsdmux {shlex.quote(control)} dut")
+        if not switched:
+            detail = "" if verified else " (image verification also failed)"
+            raise RuntimeError(
+                "usbsdmux failed to switch storage back to dut" + detail)
+        if not verified:
+            raise RuntimeError(
+                "flash verification failed: device content does not "
+                "match the image")
 
 
 def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
