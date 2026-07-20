@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+import concurrent.futures
+import threading
+
 import dut_control.server as server_mod
 import pytest
 import time
@@ -830,6 +833,68 @@ def test_flash_image_switch_back_failure_takes_precedence(monkeypatch):
             RuntimeError,
             match="switch storage back to dut.*verification also failed"):
         server_mod._flash_image(node, dut, client, "/remote/image.wic")
+
+
+def test_flash_and_verify_on_node_serializes_same_node(monkeypatch):
+    """Concurrent flashes targeting the same node must not run their
+    node commands at the same time; the second waits for the first."""
+    node = {"name": "node-serialize-test", "ssh": {"ip": "192.0.2.20"}}
+    guard = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_run_node_command(n, cmd):
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with guard:
+            active -= 1
+        return True
+
+    monkeypatch.setattr(
+        server_mod, "_run_node_command", fake_run_node_command)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(
+                server_mod._flash_and_verify_on_node,
+                node, "/dev/sg1", "/dev/sda1", f"/tmp/img-{i}")
+            for i in range(3)
+        ]
+        for f in futures:
+            f.result(timeout=5)
+
+    assert max_active == 1
+
+
+def test_flash_and_verify_on_node_different_nodes_not_serialized(
+        monkeypatch):
+    """The per-node lock must not serialize flashes across different
+    nodes: both must be able to make progress at the same time."""
+    node_a = {"name": "node-a-concurrent", "ssh": {"ip": "192.0.2.21"}}
+    node_b = {"name": "node-b-concurrent", "ssh": {"ip": "192.0.2.22"}}
+    barrier = threading.Barrier(2, timeout=2)
+
+    def fake_run_node_command(n, cmd):
+        # Only succeeds if both nodes' flashes are in flight together;
+        # a wrongful global serialization would starve this and time out.
+        barrier.wait()
+        return True
+
+    monkeypatch.setattr(
+        server_mod, "_run_node_command", fake_run_node_command)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_a = pool.submit(
+            server_mod._flash_and_verify_on_node,
+            node_a, "/dev/sg1", "/dev/sda1", "/tmp/img")
+        f_b = pool.submit(
+            server_mod._flash_and_verify_on_node,
+            node_b, "/dev/sg2", "/dev/sda2", "/tmp/img")
+        f_a.result(timeout=5)
+        f_b.result(timeout=5)
 
 
 def test_flash_node_step_failure_disables_dut(monkeypatch):
