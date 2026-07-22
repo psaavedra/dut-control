@@ -626,6 +626,7 @@ def reserve():
     return jsonify({
         "status": 0,
         "token": token,
+        "dut-name": dut["name"],
         "ip": dut["network"]["ip"],
         "ssh-port": dut["network"]["ssh-port"],
         "tunnel-ssh-port": free_port

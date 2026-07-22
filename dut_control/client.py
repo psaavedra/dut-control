@@ -46,6 +46,7 @@ def cmd_reserve(args: argparse.Namespace) -> None:
         _print_error_and_exit("reserve failed", data)
 
     print(f"token: {data['token']}")
+    print(f"dut-name: {data['dut-name']}")
     print(f"ip: {data['ip']}")
     print(f"ssh-port: {data['ssh-port']}")
     print(f"tunnel-ssh-port: {data['tunnel-ssh-port']}")
