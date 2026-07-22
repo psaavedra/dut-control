@@ -233,6 +233,7 @@ def test_reserve_success(flask_client, monkeypatch):
     data = resp.get_json()
     assert data["status"] == 0
     assert "token" in data
+    assert data["dut-name"] == dut["name"]
     assert "ip" in data
     assert "ssh-port" in data
     assert "tunnel-ssh-port" in data

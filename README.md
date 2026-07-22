@@ -217,7 +217,10 @@ On success, the service:
 {
   "status": 0,
   "token": "<reserve-token>",
-  "ssh-port": 5000
+  "dut-name": "rpi5-01",
+  "ip": "192.168.1.105",
+  "ssh-port": 22,
+  "tunnel-ssh-port": 5000
 }
 ```
 
@@ -383,7 +386,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 **Subcommands**:
 
 - **`reserve <pool>`**
-  Reserves a DUT from the given pool and prints `token` and `ssh-port` to stdout
+  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
   Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used
