@@ -35,6 +35,7 @@ Source = "https://github.com/psaavedra/dut-control.git"
 dut-control = "dut_control.server:main"
 dut-control-client = "dut_control.client:main"
 dut-control-admin = "dut_control.admin:main"
+dut-control-webadmin = "dut_control.webadmin:main"
 
 [project.optional-dependencies]
 test = [
@@ -42,4 +43,4 @@ test = [
 ]
 
 [tool.setuptools.package-data]
-"dut_control" = ["data/**/*.yml"]
+"dut_control" = ["data/**/*.yml", "webadmin_templates/*.html"]

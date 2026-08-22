@@ -13,6 +13,7 @@ Core pieces:
 - **Flask service**: `dut_control.server`
 - **Client CLI**: `dut_control.client` (installed as `dut-control-client`)
 - **Admin CLI**: `dut_control.admin` (installed as `dut-control-admin`)
+- **Admin web UI**: `dut_control.webadmin` (installed as `dut-control-webadmin`)
 
 ## Features
 
@@ -73,7 +74,7 @@ To install with test extras:
 pip install ".[test]"
 ```
 
-This will install the `dut_control` package and the console entry points `dut-control`, `dut-control-client`, and `dut-control-admin`.
+This will install the `dut_control` package and the console entry points `dut-control`, `dut-control-client`, `dut-control-admin`, and `dut-control-webadmin`.
 
 ## Configuration
 
@@ -491,6 +492,45 @@ dut-control-admin prune
 dut-control-admin dut-disable rpi5-03
 dut-control-admin dut-enable rpi5-03
 ```
+
+### dut-control-webadmin
+
+`dut-control-webadmin` is a browser UI for the `/conf/...` admin endpoints. It is a **separate HTTP service**: it renders HTML and proxies every call to dut-control server side with `requests`, exactly as `dut-control-admin` does. It never imports the service module, so it can run on a different host.
+
+A proxy is not a stylistic choice. Every dut-control endpoint accepts only `POST`/`PUT`, takes its secret in the JSON body, and sends no CORS headers, so a browser cannot call the API directly at all.
+
+**Environment**:
+
+- `DUT_CONTROL_URL` (optional): base URL of the dut-control service (default `http://localhost:8000`)
+- `DUT_CONTROL_WEBADMIN_SECRET` (optional): Flask session signing key. When unset, a random one is generated per start, so logins do not survive a restart
+
+**Options**:
+
+- `-u, --url`: dut-control base URL (default uses `DUT_CONTROL_URL` or the built-in default)
+- `--host`: address to listen on (default `0.0.0.0`)
+- `--port`: port to listen on (default `8080`)
+- `--timeout`: HTTP timeout in seconds for API calls (default 10.0)
+
+**Authentication**: there is no admin key on the command line. Opening the UI shows a login form; the key is checked against the service and then held **server side**, keyed by an opaque session id. The browser cookie carries only that id, so the admin key is never sent to the browser and never crosses the network after login. Logging out, or a restart, drops it.
+
+**Views**: the main menu links to one view per admin endpoint. Views are added incrementally; see the sections below as they land.
+
+**Example usage**:
+
+```bash
+export DUT_CONTROL_URL=http://lab-controller:8000
+export DUT_CONTROL_WEBADMIN_SECRET=$(openssl rand -hex 32)
+
+dut-control-webadmin --port 8080
+# then open http://localhost:8080/ and log in with the admin key
+```
+
+**Security notes**:
+
+- The service is an authenticated admin proxy. It binds `0.0.0.0` by default, matching `dut-control` itself, so restrict it to a trusted network or bind `--host 127.0.0.1`.
+- It runs with Flask debug off, deliberately: the Werkzeug debugger would expose an interactive console on a process holding the admin key.
+- State-changing requests carry a per-session CSRF token, and the session cookie is `HttpOnly` with `SameSite=Lax`.
+- A public login form is an online guessing oracle against the admin key; there is no rate limiting.
 
 ## Testing
 
