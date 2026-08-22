@@ -194,6 +194,31 @@ For production use you will typically want to run the Flask server behind a WSGI
 
 All API endpoints use JSON bodies and responses.
 
+### Pool listing: /pools
+
+List the pools a client can reserve from, with their DUT counts.
+
+- **Method**: `POST` (or `PUT`)
+- **Path**: `/pools`
+- **Request body**:
+  - `client-key` (string, required): client key from configuration
+
+**Success response** (HTTP 200):
+
+```json
+{
+  "status": 0,
+  "pools": [
+    { "name": "raspberrypi4-64bit", "enabled-duts": 1, "free-duts": 1 },
+    { "name": "rpi5", "enabled-duts": 3, "free-duts": 1 }
+  ]
+}
+```
+
+`enabled-duts` counts the DUTs in the pool that are enabled; `free-duts` counts those of them without an unexpired reservation, so it is what `/reserve` could currently hand out. Pools are sorted by name, and a pool whose DUTs are all disabled is omitted, since it cannot be reserved from at all.
+
+Missing or invalid `client-key` returns `status = -1`.
+
 ### Reservation: /reserve
 
 Reserve a DUT from a given pool.
@@ -397,6 +422,15 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 - `--timeout`: HTTP timeout in seconds (default 10.0)
 
 **Subcommands**:
+
+- **`pools`**
+  Calls `/pools` and prints one row per reservable pool with its enabled and free DUT counts:
+
+  ```text
+  POOL                ENABLED  FREE
+  raspberrypi4-64bit        1     1
+  rpi5                      3     1
+  ```
 
 - **`reserve <pool>`**
   Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout

@@ -22,6 +22,37 @@ def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
     sys.exit(1)
 
 
+def cmd_pools(args: argparse.Namespace) -> None:
+    client_key = os.environ.get(CLIENT_KEY_ENV)
+    if not client_key:
+        print(
+            f"error: {CLIENT_KEY_ENV} not set; cannot list pools",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    resp = requests.post(
+        _full_url(args.url, "/pools"),
+        json={"client-key": client_key},
+        timeout=args.timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") != 0:
+        _print_error_and_exit("pools failed", data)
+
+    pools = data.get("pools", [])
+    width = max([len("POOL")] + [len(p["name"]) for p in pools])
+    print(f"{'POOL':<{width}}  ENABLED  FREE")
+    for pool in pools:
+        print(
+            f"{pool['name']:<{width}}  "
+            f"{pool['enabled-duts']:>7}  "
+            f"{pool['free-duts']:>4}"
+        )
+
+
 def cmd_reserve(args: argparse.Namespace) -> None:
     client_key = os.environ.get(CLIENT_KEY_ENV)
     if not client_key:
@@ -166,6 +197,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub = p.add_subparsers(dest="command", required=True)
+
+    # pools
+    sp_pools = sub.add_parser(
+        "pools",
+        help="List pools with their enabled and free DUT counts",
+    )
+    sp_pools.set_defaults(func=cmd_pools)
 
     # reserve
     sp_reserve = sub.add_parser(
