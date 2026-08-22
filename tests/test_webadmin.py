@@ -728,6 +728,116 @@ def test_prune_action_reports_a_failure(web_client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# DUT enable / disable action
+# ---------------------------------------------------------------------------
+
+def test_parse_bool_accepts_form_strings():
+    for text in ("true", "TRUE", "1", "yes", "on", " true "):
+        assert webadmin_mod._parse_bool(text) is True
+    for text in ("false", "FALSE", "0", "no", "off"):
+        assert webadmin_mod._parse_bool(text) is False
+
+
+def test_parse_bool_rejects_junk():
+    for value in (None, "", "maybe", "2", "disable"):
+        assert webadmin_mod._parse_bool(value) is None
+
+
+def test_dut_action_sends_a_real_boolean(web_client, monkeypatch):
+    """The endpoint type checks the field, so "false" would be refused."""
+    token = _log_in(web_client, monkeypatch)
+    calls = _stub_api_paths(monkeypatch, {
+        "/conf/dut/enabled": _ok({"result": 0, "dut-name": "rpi5-01",
+                                  "enabled": False}),
+    })
+
+    resp = web_client.post("/actions/dut", data={
+        "csrf": token, "dut-name": "rpi5-01", "enabled": "false"})
+    assert resp.status_code == 302
+    assert "/nodes" in resp.headers["Location"]
+
+    assert calls == [("/conf/dut/enabled",
+                      {"admin-key": "admin-key-01",
+                       "dut-name": "rpi5-01", "enabled": False})]
+    assert calls[0][1]["enabled"] is False
+
+
+def test_dut_action_enables_a_dut(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    calls = _stub_api_paths(monkeypatch, {
+        "/conf/dut/enabled": _ok({"result": 0}),
+    })
+
+    web_client.post("/actions/dut", data={
+        "csrf": token, "dut-name": "rpi5-01", "enabled": "true"})
+    assert calls[0][1]["enabled"] is True
+
+    body = web_client.get("/nodes").data.decode()
+    assert "rpi5-01 enabled" in body
+    # The in-memory caveat travels with the confirmation
+    assert "reload reverts this" in body
+
+
+def test_dut_action_reports_dut_not_found(web_client, monkeypatch):
+    """result -2 arrives with HTTP 200, so a 200 is not a success."""
+    token = _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/dut/enabled": _ok({"result": -2, "error": "dut not found"}),
+    })
+
+    resp = web_client.post("/actions/dut", data={
+        "csrf": token, "dut-name": "ghost", "enabled": "false"},
+        follow_redirects=True)
+    assert b"could not update ghost" in resp.data
+    assert b"dut not found" in resp.data
+
+
+def test_dut_action_rejects_a_missing_name(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    calls = _stub_api_paths(monkeypatch, {})
+
+    resp = web_client.post("/actions/dut", data={
+        "csrf": token, "dut-name": "  ", "enabled": "true"},
+        follow_redirects=True)
+    assert b"DUT name and a target state are required" in resp.data
+    # Nothing is sent to the service
+    assert [c for c in calls if c[0] == "/conf/dut/enabled"] == []
+
+
+def test_dut_action_rejects_an_unparsable_state(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    calls = _stub_api_paths(monkeypatch, {})
+
+    web_client.post("/actions/dut", data={
+        "csrf": token, "dut-name": "rpi5-01", "enabled": "perhaps"})
+    assert [c for c in calls if c[0] == "/conf/dut/enabled"] == []
+
+
+def test_dut_action_reports_an_unreachable_service(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/dut/enabled": _fail("cannot reach dut-control at x"),
+    })
+
+    resp = web_client.post("/actions/dut", data={
+        "csrf": token, "dut-name": "rpi5-01", "enabled": "false"},
+        follow_redirects=True)
+    assert b"could not update rpi5-01" in resp.data
+
+
+def test_nodes_view_offers_the_matching_toggle(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    node = _make_node(duts=[_make_dut("on-01", enabled=True),
+                            _make_dut("off-01", enabled=False)])
+    _stub_api_paths(monkeypatch, {"/conf/info/nodes": _ok([node])})
+
+    body = web_client.get("/nodes").data.decode()
+    assert ">disable<" in body
+    assert ">enable<" in body
+    assert 'value="on-01"' in body and 'value="off-01"' in body
+
+
+# ---------------------------------------------------------------------------
 # Import hygiene
 # ---------------------------------------------------------------------------
 

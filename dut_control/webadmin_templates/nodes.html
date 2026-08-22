@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import kv, badge %}
+{% from "_macros.html" import kv, badge, action_form %}
 {% block title %}nodes - dut-control admin{% endblock %}
 {% block content %}
 <h2>nodes and DUTs</h2>
@@ -14,6 +14,7 @@
     <tr>
       <th>DUT</th><th>pool</th><th>state</th>
       <th>network</th><th>storage</th><th>power</th>
+      <th>action</th>
     </tr>
   </thead>
   <tbody>
@@ -31,12 +32,27 @@
       <td>{{ kv(dut['network']) }}</td>
       <td>{{ kv(dut['storage']) }}</td>
       <td>{{ kv(dut['power']) }}</td>
+      <td>
+        {%- if dut['metadata'].get('enabled', True) -%}
+          {{ action_form('action_dut', 'disable', csrf_token,
+                         {'dut-name': dut['name'], 'enabled': 'false'}) }}
+        {%- else -%}
+          {{ action_form('action_dut', 'enable', csrf_token,
+                         {'dut-name': dut['name'], 'enabled': 'true'}) }}
+        {%- endif -%}
+      </td>
     </tr>
   {% endfor %}
   {% if not node['duts'] %}
-    <tr><td colspan="6" class="muted">no DUTs on this node</td></tr>
+    <tr><td colspan="7" class="muted">no DUTs on this node</td></tr>
   {% endif %}
   </tbody>
 </table>
 {% endfor %}
+<p class="note">
+  Disabling a DUT hides it from pool lookups, so it cannot be reserved
+  again, while reservations already issued for it keep working. The
+  change lives in memory only: a configuration reload, or a restart,
+  puts back whatever the node YAML says.
+</p>
 {% endblock %}

@@ -513,7 +513,7 @@ A proxy is not a stylistic choice. Every dut-control endpoint accepts only `POST
 
 **Authentication**: there is no admin key on the command line. Opening the UI shows a login form; the key is checked against the service and then held **server side**, keyed by an opaque session id. The browser cookie carries only that id, so the admin key is never sent to the browser and never crosses the network after login. Logging out, or a restart, drops it.
 
-**Actions**: the main menu offers a configuration reload, and the reservations view offers a prune of expired records. Both are POST forms carrying a per-session CSRF token, and both redirect and report the outcome, so refreshing a page cannot repeat them. A prune reports how many records it removed and reminds you that tunnel processes are left running.
+**Actions**: the main menu offers a configuration reload, the reservations view offers a prune of expired records, and each DUT row on the nodes view has an enable or disable button. Disabling a DUT keeps it out of new reservations while leaving any it already has alone, and the change is in memory only, so a reload puts the YAML value back. Both are POST forms carrying a per-session CSRF token, and both redirect and report the outcome, so refreshing a page cannot repeat them. A prune reports how many records it removed and reminds you that tunnel processes are left running.
 
 **Views**:
 

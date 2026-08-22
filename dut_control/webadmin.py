@@ -210,6 +210,22 @@ def _fmt_delta(value) -> str:
     return f"{_fmt_span(-delta)} ago"
 
 
+def _parse_bool(value):
+    """
+    Read a boolean out of form data, or None when it is not one.
+
+    /conf/dut/enabled type checks the field with isinstance(x, bool)
+    and rejects anything else, so the string an HTML form sends has to
+    be converted before it goes out.
+    """
+    text = str(value or "").strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 app.jinja_env.filters["mask"] = _mask_key
 app.jinja_env.filters["epoch"] = _fmt_epoch
 app.jinja_env.filters["delta"] = _fmt_delta
@@ -415,6 +431,42 @@ def action_prune():
     else:
         flash(f"prune failed: {result['error']}", "error")
     return redirect(url_for("reserves"))
+
+
+def _flash_dut_result(result, name: str, enabled: bool) -> None:
+    """
+    Report /conf/dut/enabled.
+
+    That endpoint answers HTTP 200 even when it refuses, and signals
+    the outcome in `result` rather than in the `status` field every
+    other endpoint uses, so a 200 is not by itself a success.
+    """
+    if not result["ok"]:
+        flash(f"could not update {name}: {result['error']}", "error")
+        return
+    data = result["data"] or {}
+    if data.get("result") != 0:
+        reason = data.get("error", "unknown error")
+        flash(f"could not update {name}: {reason}", "error")
+        return
+    state = "enabled" if enabled else "disabled"
+    flash(f"{name} {state}; a configuration reload reverts this", "ok")
+
+
+@app.route("/actions/dut", methods=["POST"])
+@login_required
+def action_dut():
+    name = (request.form.get("dut-name") or "").strip()
+    enabled = _parse_bool(request.form.get("enabled"))
+    if not name or enabled is None:
+        flash("a DUT name and a target state are required", "error")
+        return redirect(url_for("nodes"))
+    result = _admin_post("/conf/dut/enabled",
+                         {"dut-name": name, "enabled": enabled})
+    if result["auth"]:
+        return _auth_failed()
+    _flash_dut_result(result, name, enabled)
+    return redirect(url_for("nodes"))
 
 
 @app.route("/logout", methods=["POST"])
