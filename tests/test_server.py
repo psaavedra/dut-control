@@ -94,6 +94,11 @@ def _make_node_dut(
     return node, node["duts"][0]
 
 
+def _is_bmap_scp(cmd) -> bool:
+    """True for the scp call probing for the image's optional .bmap."""
+    return cmd[0] == "scp" and any(".bmap" in a for a in cmd)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: helpers
 # ---------------------------------------------------------------------------
@@ -669,6 +674,9 @@ def test_flash_image_uses_unique_node_tmp_path(monkeypatch):
     ssh_cmds = []
 
     def fake_run(cmd, **kwargs):
+        if _is_bmap_scp(cmd):
+            # No bmap next to this image; exercise the --nobmap flow
+            return server_mod.subprocess.CompletedProcess(cmd, 1)
         if cmd[0] == "scp" and "@" in cmd[-1] and ":" in cmd[-1]:
             scp_to_node_targets.append(cmd[-1].split(":", 1)[1])
         elif cmd[0] == "ssh":
@@ -709,24 +717,31 @@ def test_flash_image_quotes_awkward_image_names(monkeypatch):
     ssh_cmds = []
 
     def fake_run(cmd, **kwargs):
+        rc = 0
         if cmd[0] == "scp":
             scp_remote_specs.extend(
                 a for a in cmd if "@" in a and ":" in a)
+            if _is_bmap_scp(cmd):
+                rc = 1  # no bmap next to this image
         elif cmd[0] == "ssh":
             ssh_cmds.append(cmd[-1])
-        return server_mod.subprocess.CompletedProcess(cmd, 0)
+        return server_mod.subprocess.CompletedProcess(cmd, rc)
 
     monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
 
     server_mod._flash_image(node, dut, client, "/remote/im age;$(x).wic")
 
-    # scp remote paths are shell-quoted (client source and node target)
-    assert len(scp_remote_specs) == 2
+    # scp remote paths are shell-quoted: the image (client source and
+    # node target) and the bmap probe derived from its name
+    image_specs = [s for s in scp_remote_specs if ".bmap" not in s]
+    bmap_specs = [s for s in scp_remote_specs if ".bmap" in s]
+    assert len(image_specs) == 2
+    assert len(bmap_specs) == 1
     for spec in scp_remote_specs:
         assert spec.split(":", 1)[1].startswith("'")
 
     # Every node command referencing the image uses the quoted tmp path
-    node_tmp = scp_remote_specs[1].split(":", 1)[1]
+    node_tmp = image_specs[1].split(":", 1)[1]
     quoted = shlex.quote(shlex.split(node_tmp)[0])
     assert quoted == node_tmp
     for marker in ("bmaptool", "sha256sum", "rm -f"):
@@ -745,6 +760,8 @@ def test_flash_image_verifies_device_content(monkeypatch):
     ssh_cmds = []
 
     def fake_run(cmd, **kwargs):
+        if _is_bmap_scp(cmd):
+            return server_mod.subprocess.CompletedProcess(cmd, 1)
         if cmd[0] == "ssh":
             ssh_cmds.append(cmd[-1])
         return server_mod.subprocess.CompletedProcess(cmd, 0)
@@ -775,6 +792,8 @@ def test_flash_image_raises_when_verification_fails(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         rc = 0
+        if _is_bmap_scp(cmd):
+            return server_mod.subprocess.CompletedProcess(cmd, 1)
         if cmd[0] == "ssh":
             ssh_cmds.append(cmd[-1])
             if "sha256sum" in cmd[-1]:
@@ -813,6 +832,131 @@ def test_flash_verify_command_checksums_decompressed_stream():
     assert " -dc" not in cmd
 
 
+def test_bmap_path_for_image():
+    """The bmap name drops the compression suffix and appends .bmap."""
+    assert server_mod._bmap_path_for_image(
+        "/home/dutctl/core-image-weston-wpe-raspberrypi5-0.wic.bz2"
+    ) == "/home/dutctl/core-image-weston-wpe-raspberrypi5-0.wic.bmap"
+
+    # Uncompressed images keep their name and gain .bmap
+    assert server_mod._bmap_path_for_image(
+        "/images/core-image.wic") == "/images/core-image.wic.bmap"
+
+    # Other compressors behave the same
+    assert server_mod._bmap_path_for_image(
+        "/images/core-image.wic.gz") == "/images/core-image.wic.bmap"
+
+    # The image inside a tarball is not derivable, so no bmap is guessed
+    assert server_mod._bmap_path_for_image("/images/rootfs.tar.xz") is None
+
+
+def test_flash_image_uses_bmap_when_present(monkeypatch):
+    """When a .bmap sits next to the image it is staged to the node and
+    passed to bmaptool, and the whole-image read-back is skipped since
+    bmaptool only writes the mapped blocks."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    scp_specs = []
+    ssh_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "scp":
+            scp_specs.extend(a for a in cmd if "@" in a and ":" in a)
+        elif cmd[0] == "ssh":
+            ssh_cmds.append(cmd[-1])
+        return server_mod.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    server_mod._flash_image(
+        node, dut, client, "/home/dutctl/core-image.wic.bz2")
+
+    # The bmap was fetched from the client and pushed to the node
+    bmap_specs = [s for s in scp_specs if s.endswith(".bmap")]
+    assert len(bmap_specs) == 2
+    assert bmap_specs[0].endswith("/home/dutctl/core-image.wic.bmap")
+    node_bmap = bmap_specs[1].split(":", 1)[1]
+
+    # bmaptool got --bmap pointing at the staged copy, not --nobmap
+    bmaptool_cmds = [c for c in ssh_cmds if "bmaptool" in c]
+    assert len(bmaptool_cmds) == 1
+    assert f"--bmap {node_bmap}" in bmaptool_cmds[0]
+    assert "--nobmap" not in bmaptool_cmds[0]
+
+    # Read-back verification is skipped, mux is still handed back, and
+    # both staged files are removed from the node
+    assert not [c for c in ssh_cmds if "sha256sum" in c]
+    assert "usbsdmux /dev/sg1 dut" in ssh_cmds
+    rm_cmds = [c for c in ssh_cmds if c.startswith("rm -f ")]
+    assert len(rm_cmds) == 1
+    assert node_bmap in rm_cmds[0]
+    assert "core-image.wic.bz2" in rm_cmds[0]
+
+
+def test_flash_image_falls_back_to_nobmap_when_absent(monkeypatch):
+    """A missing bmap must not fail the flash: bmaptool runs with
+    --nobmap and the read-back verification still guards the write."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    ssh_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        if _is_bmap_scp(cmd):
+            return server_mod.subprocess.CompletedProcess(cmd, 1)
+        if cmd[0] == "ssh":
+            ssh_cmds.append(cmd[-1])
+        return server_mod.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    server_mod._flash_image(
+        node, dut, client, "/home/dutctl/core-image.wic.bz2")
+
+    bmaptool_cmds = [c for c in ssh_cmds if "bmaptool" in c]
+    assert len(bmaptool_cmds) == 1
+    assert "--nobmap" in bmaptool_cmds[0]
+    assert len([c for c in ssh_cmds if "sha256sum" in c]) == 1
+
+    # Nothing bmap-related is left to clean up on the node
+    rm_cmds = [c for c in ssh_cmds if c.startswith("rm -f ")]
+    assert len(rm_cmds) == 1
+    assert ".bmap" not in rm_cmds[0]
+
+
+def test_flash_image_removes_tmpdir_after_partial_bmap_fetch(monkeypatch):
+    """A failed bmap fetch can leave a partial file in the temp dir; the
+    directory must still be removed rather than leaking under /tmp."""
+    node, dut = _make_node_dut(pool="pool-01")
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+    client = _make_client()
+
+    tmpdirs = []
+
+    def fake_run(cmd, **kwargs):
+        dest = cmd[-1]
+        if cmd[0] == "scp" and "@" not in dest:
+            # Local destination: scp writes something even when it then
+            # fails partway through the transfer
+            Path(dest).touch()
+            if _is_bmap_scp(cmd):
+                tmpdirs.append(str(Path(dest).parent))
+                return server_mod.subprocess.CompletedProcess(cmd, 1)
+        return server_mod.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(server_mod.subprocess, "run", fake_run)
+
+    server_mod._flash_image(
+        node, dut, client, "/home/dutctl/core-image.wic.bz2")
+
+    assert tmpdirs, "the bmap fetch was never attempted"
+    for tmpdir in tmpdirs:
+        assert not Path(tmpdir).exists(), f"{tmpdir} leaked"
+
+
 def test_flash_image_switch_back_failure_takes_precedence(monkeypatch):
     """When verification and the mux switch-back both fail, the error
     reports the stuck mux first (it needs operator action) but still
@@ -823,6 +967,8 @@ def test_flash_image_switch_back_failure_takes_precedence(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         rc = 0
+        if _is_bmap_scp(cmd):
+            return server_mod.subprocess.CompletedProcess(cmd, 1)
         if cmd[0] == "ssh" and (
                 "sha256sum" in cmd[-1] or cmd[-1].endswith(" dut")):
             rc = 1

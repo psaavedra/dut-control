@@ -299,14 +299,27 @@ Flash an image onto DUT storage via the node.
 The service performs the following steps:
 
 1. Copies the image from the client to a temporary directory on the service host using `scp`
-2. Copies the image from the service host to the node under `/tmp/` using `scp`
+2. Copies the image from the service host to the node under `/tmp/` using `scp`, together with the image's `.bmap` file when one exists (see **Block maps** below)
 3. On the node, runs:
    - `usbsdmux <control> host`
-   - `bmaptool copy --nobmap <image> <device>`
-4. Verifies the flash on the node by reading back the first image-size bytes of the device (direct I/O, bypassing the page cache) and comparing their SHA-256 checksum against the image's. For compressed images (`.gz`, `.bz2`, `.xz`, `.zst`, `.lz4`, `.lzo`, including compressed tarballs), which `bmaptool` decompresses while writing, the size and checksum are computed over the decompressed stream — the corresponding decompression tool must be available on the node
+   - `bmaptool copy --bmap <bmap> <image> <device>`, or `bmaptool copy --nobmap <image> <device>` when no `.bmap` was found
+4. Verifies the flash on the node by reading back the first image-size bytes of the device (direct I/O, bypassing the page cache) and comparing their SHA-256 checksum against the image's. For compressed images (`.gz`, `.bz2`, `.xz`, `.zst`, `.lz4`, `.lzo`, including compressed tarballs), which `bmaptool` decompresses while writing, the size and checksum are computed over the decompressed stream — the corresponding decompression tool must be available on the node. This step is skipped for `--bmap` copies (see **Block maps**)
 5. Runs `usbsdmux <control> dut` on the node to hand the storage back to the DUT (this happens even if verification fails, so the mux is left in a known state)
 
 Storage parameters (`control` and `device`) are read from the DUT `storage` configuration.
+
+#### Block maps
+
+If a `.bmap` file sits next to the image on the client, the service copies it along with the image and passes it to `bmaptool`. The bmap name is derived from the image by dropping the compression suffix and appending `.bmap`, following the usual Yocto layout:
+
+```text
+core-image-weston-wpe-raspberrypi5-0.wic.bmap
+core-image-weston-wpe-raspberrypi5-0.wic.bz2   <-- path passed to /flash
+```
+
+With a bmap, `bmaptool` copies only the blocks the bmap maps (much faster than a full write) and checksums the copied data against the bmap while writing. The bmap is optional and best-effort: if it does not exist, or cannot be copied, the flash proceeds with `--nobmap` and no error is reported. No bmap is guessed for compressed tarballs, whose contained image name is not derivable.
+
+Because a bmap copy writes only mapped blocks, the unmapped areas of the device keep whatever they held before, and the whole-image read-back of step 4 would never match. That verification is therefore skipped for `--bmap` copies, which instead rely on `bmaptool`'s own per-block checksum verification.
 
 Step 3-5 (the node-side flash/verify/switch-back) is serialized per node: if two `/flash` requests target DUTs on the same node at the same time, the second request blocks until the first one finishes instead of racing it on the node's usbsdmux/bmaptool. Flashes to different nodes still run concurrently.
 
