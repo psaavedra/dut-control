@@ -290,6 +290,40 @@ def _list_duts_in_pool(pool: str):
     return result
 
 
+def _reserved_dut_names(now: int):
+    """Names of DUTs held by a reservation that has not expired yet."""
+    with state_lock:
+        return {r["dut-name"] for r in reserves
+                if r.get("valid-until", 0) >= now}
+
+
+def _list_pools():
+    """
+    Per-pool summary: how many DUTs are enabled and how many of those
+    are not currently reserved. Only pools with at least one enabled
+    DUT are listed, which is exactly what _pool_exists considers to
+    exist and therefore what /reserve can hand out.
+    """
+    pools = {}
+    with state_lock:
+        # Both halves under one acquisition: reading the reservations
+        # and walking the nodes under separate ones could mix two
+        # states and report a count that never actually held. Nesting
+        # is fine, state_lock is reentrant.
+        reserved = _reserved_dut_names(_now_epoch())
+        for node in nodes:
+            for dut in node.get("duts", []):
+                pool = dut.get("metadata", {}).get("pool")
+                if not pool or not _dut_enabled(dut):
+                    continue
+                entry = pools.setdefault(
+                    pool, {"name": pool, "enabled-duts": 0, "free-duts": 0})
+                entry["enabled-duts"] += 1
+                if dut.get("name") not in reserved:
+                    entry["free-duts"] += 1
+    return [pools[name] for name in sorted(pools)]
+
+
 def _get_dut_and_node_by_name(dut_name: str):
     with state_lock:
         for node in nodes:
@@ -581,6 +615,13 @@ def _rollback_reserve(token: str):
         reserves[:] = [r for r in reserves if r.get("token") != token]
 
 
+@server.route("/pools", methods=["POST", "PUT"])
+@validate_client
+def pools():
+    """List reservable pools with their enabled and free DUT counts."""
+    return jsonify({"status": 0, "pools": _list_pools()}), 200
+
+
 @server.route("/reserve", methods=["POST", "PUT"])
 @validate_client
 @validate_pool
@@ -590,9 +631,7 @@ def reserve():
     now = _now_epoch()
 
     # Early check: any available DUTs?
-    with state_lock:
-        in_use_duts = {r["dut-name"] for r in reserves
-                       if r.get("valid-until", 0) >= now}
+    in_use_duts = _reserved_dut_names(now)
     available = [(node, dut) for (node, dut) in duts_in_pool
                  if dut["name"] not in in_use_duts]
     if not available:
