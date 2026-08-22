@@ -194,6 +194,119 @@ def test_validate_token_missing_token(flask_client):
 
 
 # ---------------------------------------------------------------------------
+# /pools endpoint
+# ---------------------------------------------------------------------------
+
+def _make_pool_dut(name, pool, enabled=True):
+    return {
+        "name": name,
+        "metadata": {"pool": pool, "enabled": enabled},
+        "network": {"ip": "192.0.2.30", "ssh-port": 22},
+        "storage": {},
+        "power": {},
+    }
+
+
+def test_pools_counts_enabled_and_free_duts(flask_client):
+    """Each pool reports its enabled DUTs and how many are unreserved;
+    pools whose DUTs are all disabled are not reservable, so they are
+    left out entirely."""
+    client = _make_client()
+    node = {
+        "name": "node-01",
+        "ssh": {"ip": "192.0.2.20", "port": 22, "user": "runner"},
+        "duts": [
+            _make_pool_dut("rpi5-01", "rpi5"),
+            _make_pool_dut("rpi5-02", "rpi5"),
+            _make_pool_dut("rpi5-03", "rpi5", enabled=False),
+            _make_pool_dut("rpi4-01", "rpi4"),
+            _make_pool_dut("old-01", "retired", enabled=False),
+        ],
+    }
+
+    now = int(time.time())
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+        # One active reservation and one already expired
+        server_mod.reserves.extend([
+            {"token": "t1", "valid-from": now - 10, "valid-until": now + 600,
+             "client-key": client["key"], "dut-name": "rpi5-01"},
+            {"token": "t2", "valid-from": now - 100, "valid-until": now - 10,
+             "client-key": client["key"], "dut-name": "rpi4-01"},
+        ])
+
+    resp = flask_client.post("/pools", json={"client-key": client["key"]})
+    data = resp.get_json()
+    assert data["status"] == 0
+    # Sorted by pool name; the fully disabled pool is absent
+    assert data["pools"] == [
+        {"name": "rpi4", "enabled-duts": 1, "free-duts": 1},
+        {"name": "rpi5", "enabled-duts": 2, "free-duts": 1},
+    ]
+
+
+def test_list_pools_reads_one_locked_snapshot(monkeypatch):
+    """The reservation set and the node walk must come from a single
+    state_lock acquisition; taken separately, the counts could mix two
+    states and report a total that never held."""
+    with server_mod.state_lock:
+        server_mod.nodes[:] = [{
+            "name": "node-01",
+            "ssh": {"ip": "192.0.2.20"},
+            "duts": [_make_pool_dut("rpi5-01", "rpi5")],
+        }]
+
+    real_reserved_dut_names = server_mod._reserved_dut_names
+    locked_during_call = []
+
+    def probing_reserved_dut_names(now):
+        # Another thread cannot take the lock while this runs, so the
+        # non-blocking acquire must fail. Probing from this thread
+        # would always succeed: state_lock is reentrant.
+        def probe():
+            acquired = server_mod.state_lock.acquire(blocking=False)
+            locked_during_call.append(not acquired)
+            if acquired:
+                server_mod.state_lock.release()
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join()
+        return real_reserved_dut_names(now)
+
+    monkeypatch.setattr(
+        server_mod, "_reserved_dut_names", probing_reserved_dut_names)
+
+    assert server_mod._list_pools() == [
+        {"name": "rpi5", "enabled-duts": 1, "free-duts": 1},
+    ]
+    assert locked_during_call == [True]
+
+
+def test_pools_requires_valid_client_key(flask_client):
+    with server_mod.state_lock:
+        server_mod.clients[:] = [_make_client()]
+
+    resp = flask_client.post("/pools", json={"client-key": "nope"})
+    data = resp.get_json()
+    assert data["status"] == -1
+    assert "client key is not valid" in data["error"]
+
+
+def test_pools_empty_when_no_duts_configured(flask_client):
+    client = _make_client()
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = []
+
+    resp = flask_client.post("/pools", json={"client-key": client["key"]})
+    data = resp.get_json()
+    assert data["status"] == 0
+    assert data["pools"] == []
+
+
+# ---------------------------------------------------------------------------
 # /reserve endpoint
 # ---------------------------------------------------------------------------
 
