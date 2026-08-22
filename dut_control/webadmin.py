@@ -298,6 +298,17 @@ def login():
     return render_template("login.html")
 
 
+def _as_rows(data):
+    """
+    Coerce a list payload, tolerating anything else.
+
+    The info endpoints answer with a JSON array, but the payload comes
+    from a separately deployed service; a view that iterated a dict
+    would hand back a 500 rather than a page saying nothing is there.
+    """
+    return data if isinstance(data, list) else []
+
+
 def _fetch_list(path: str, extra: dict = None):
     """
     Read a list endpoint.
@@ -313,7 +324,7 @@ def _fetch_list(path: str, extra: dict = None):
     if not result["ok"]:
         flash(result["error"], "error")
         return [], None
-    return result["data"] or [], None
+    return _as_rows(result["data"]), None
 
 
 def _fetch_lookup(path: str):
@@ -324,7 +335,7 @@ def _fetch_lookup(path: str):
     the node names is better than losing the reservations.
     """
     result = _admin_post(path)
-    return result["data"] or [] if result["ok"] else []
+    return _as_rows(result["data"]) if result["ok"] else []
 
 
 @app.route("/nodes")
@@ -372,6 +383,38 @@ def reserves():
         int(time.time()),
     )
     return render_template("reserves.html", reserves=items, active=active)
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+@app.route("/actions/reload", methods=["POST"])
+@login_required
+def action_reload():
+    result = _admin_post("/conf/reload")
+    if result["auth"]:
+        return _auth_failed()
+    if result["ok"]:
+        flash("configuration reloaded from YAML", "ok")
+    else:
+        flash(f"reload failed: {result['error']}", "error")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/actions/prune", methods=["POST"])
+@login_required
+def action_prune():
+    result = _admin_post("/conf/reserves/prune")
+    if result["auth"]:
+        return _auth_failed()
+    if result["ok"]:
+        pruned = (result["data"] or {}).get("pruned", 0)
+        flash(f"pruned {pruned} expired reservation(s); tunnel "
+              "processes are left running", "ok")
+    else:
+        flash(f"prune failed: {result['error']}", "error")
+    return redirect(url_for("reserves"))
 
 
 @app.route("/logout", methods=["POST"])

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import action_form %}
 {% block content %}
 <h2>admin views</h2>
 <ul class="menu">
@@ -19,4 +20,11 @@
     <p>Reservations with their DUT, node, pool, client and expiry.</p>
   </li>
 </ul>
+<h3>actions</h3>
+{{ action_form('action_reload', 'reload configuration', csrf_token) }}
+<p class="note">
+  Re-reads conf.yml, clients/*.yml and nodes/*.yml. Reservations and
+  tunnels are untouched, but any DUT enabled or disabled at runtime
+  goes back to whatever its YAML says.
+</p>
 {% endblock %}

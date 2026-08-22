@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge %}
+{% from "_macros.html" import badge, action_form %}
 {% block title %}reserves - dut-control admin{% endblock %}
 {% block content %}
 <h2>reservations</h2>
@@ -13,6 +13,7 @@
     <a href="{{ url_for('reserves', active=1) }}">show current only</a>
   {% endif %}
 </p>
+{{ action_form('action_prune', 'prune expired', csrf_token) }}
 {% if not reserves %}
 <p class="muted">no reservations recorded</p>
 {% else %}

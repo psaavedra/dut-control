@@ -187,6 +187,14 @@ def test_full_url_joins_without_doubling_slashes(monkeypatch):
         "http://lab:8000/conf/reload"
 
 
+def test_as_rows_ignores_a_non_list_payload():
+    """A view must not iterate whatever shape the service sends."""
+    assert webadmin_mod._as_rows([{"a": 1}]) == [{"a": 1}]
+    assert webadmin_mod._as_rows({"result": 0}) == []
+    assert webadmin_mod._as_rows(None) == []
+    assert webadmin_mod._as_rows("nope") == []
+
+
 # ---------------------------------------------------------------------------
 # Login / logout / access control
 # ---------------------------------------------------------------------------
@@ -627,6 +635,96 @@ def test_reserves_view_handles_an_empty_list(web_client, monkeypatch):
     resp = web_client.get("/reserves")
     assert resp.status_code == 200
     assert b"no reservations recorded" in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Reload and prune actions
+# ---------------------------------------------------------------------------
+
+def test_reload_action_requires_login(web_client):
+    resp = web_client.post("/actions/reload", data={})
+    # No session means no CSRF token to present either
+    assert resp.status_code in (302, 400)
+
+
+def test_reload_action_rejects_get(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    assert web_client.get("/actions/reload").status_code == 405
+
+
+def test_reload_action_flashes_success(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    calls = _stub_api(monkeypatch, _ok({"result": 0}))
+
+    resp = web_client.post("/actions/reload", data={"csrf": token},
+                           follow_redirects=True)
+    assert resp.status_code == 200
+    assert calls == [("/conf/reload", {"admin-key": "admin-key-01"})]
+    assert b"configuration reloaded" in resp.data
+
+
+def test_reload_action_reports_a_non_json_failure(web_client, monkeypatch):
+    """A broken conf.yml makes /conf/reload answer with HTML, not JSON."""
+    token = _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch,
+              _fail("the service returned a non-JSON response "
+                    "(HTTP 500); check its log"))
+
+    resp = web_client.post("/actions/reload", data={"csrf": token},
+                           follow_redirects=True)
+    assert resp.status_code == 200
+    assert b"reload failed" in resp.data
+    assert b"non-JSON" in resp.data
+
+
+def test_reload_action_logs_out_when_the_key_is_rejected(
+        web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _fail("rejected", auth=True))
+
+    resp = web_client.post("/actions/reload", data={"csrf": token})
+    assert resp.status_code == 302
+    assert "/login" in resp.headers["Location"]
+    assert webadmin_mod._sessions == {}
+
+
+def test_prune_action_reports_the_pruned_count(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    calls = _stub_api_paths(monkeypatch, {
+        "/conf/reserves/prune": _ok({"result": 0, "pruned": 3}),
+    })
+
+    resp = web_client.post("/actions/prune", data={"csrf": token})
+    assert resp.status_code == 302
+    assert "/reserves" in resp.headers["Location"]
+    assert calls == [("/conf/reserves/prune",
+                      {"admin-key": "admin-key-01"})]
+    calls.clear()
+
+    body = web_client.get("/reserves").data.decode()
+    assert "pruned 3 expired reservation(s)" in body
+    # The count comes with the caveat that tunnels survive a prune
+    assert "tunnel" in body
+
+
+def test_prune_action_tolerates_a_missing_count(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/reserves/prune": _ok({"result": 0}),
+    })
+
+    resp = web_client.post("/actions/prune", data={"csrf": token},
+                           follow_redirects=True)
+    assert b"pruned 0 expired" in resp.data
+
+
+def test_prune_action_reports_a_failure(web_client, monkeypatch):
+    token = _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _fail("cannot reach dut-control at x"))
+
+    resp = web_client.post("/actions/prune", data={"csrf": token},
+                           follow_redirects=True)
+    assert b"prune failed" in resp.data
 
 
 # ---------------------------------------------------------------------------

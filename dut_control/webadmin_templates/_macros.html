@@ -12,3 +12,15 @@
 {% macro badge(text, kind) %}
 <span class="badge {{ kind }}">{{ text }}</span>
 {%- endmacro %}
+
+{# A POST form for a mutating action. The CSRF token is passed in so no
+   caller can forget it and get a 400 at runtime. #}
+{% macro action_form(endpoint, label, token, fields={}) %}
+<form method="post" action="{{ url_for(endpoint) }}" class="inline">
+  <input type="hidden" name="csrf" value="{{ token }}">
+  {%- for name, value in fields.items() %}
+  <input type="hidden" name="{{ name }}" value="{{ value }}">
+  {%- endfor %}
+  <button type="submit">{{ label }}</button>
+</form>
+{%- endmacro %}
