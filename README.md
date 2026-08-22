@@ -513,7 +513,12 @@ A proxy is not a stylistic choice. Every dut-control endpoint accepts only `POST
 
 **Authentication**: there is no admin key on the command line. Opening the UI shows a login form; the key is checked against the service and then held **server side**, keyed by an opaque session id. The browser cookie carries only that id, so the admin key is never sent to the browser and never crosses the network after login. Logging out, or a restart, drops it.
 
-**Views**: the main menu links to one view per admin endpoint. Views are added incrementally; see the sections below as they land.
+**Views**:
+
+- **nodes and DUTs**: one table per node, with each DUT's pool, enabled state, and its network, storage and power sections rendered generically, so keys added to a node YAML file show up rather than being dropped
+- **clients**: configured clients with SSH details and tunnel port ranges
+
+A client key is enough to reserve DUTs, so the clients view masks each one (`fac7...132a`) until you expand it. Expanding puts the full key in that page, so treat it as you would `dut-control-admin clients` output.
 
 **Example usage**:
 

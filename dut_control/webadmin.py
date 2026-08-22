@@ -159,6 +159,27 @@ def _inject_globals():
 
 
 # ---------------------------------------------------------------------------
+# Presentation
+# ---------------------------------------------------------------------------
+
+def _mask_key(value, keep: int = 4) -> str:
+    """
+    Shorten a secret for display, keeping only its ends.
+
+    /conf/info/clients hands back every client key in the clear, and
+    those keys are enough to reserve DUTs, so no view renders one
+    verbatim without being asked.
+    """
+    text = str(value or "")
+    if len(text) <= keep * 2:
+        return "*" * len(text)
+    return f"{text[:keep]}...{text[-keep:]}"
+
+
+app.jinja_env.filters["mask"] = _mask_key
+
+
+# ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
 
@@ -216,6 +237,15 @@ def nodes():
     if failure is not None:
         return failure
     return render_template("nodes.html", nodes=rows)
+
+
+@app.route("/clients")
+@login_required
+def clients():
+    rows, failure = _fetch_list("/conf/info/clients")
+    if failure is not None:
+        return failure
+    return render_template("clients.html", clients=rows)
 
 
 @app.route("/logout", methods=["POST"])

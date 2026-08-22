@@ -103,6 +103,15 @@ def _make_dut(name="rpi5-01", pool="rpi5", enabled=True):
     }
 
 
+def _make_api_client(name="client-01", key="fac72a9494cd132a"):
+    return {
+        "name": name,
+        "key": key,
+        "ssh": {"ip": "192.0.2.10", "port": 22, "user": "tester"},
+        "ports-range": {"from": 5000, "to": 5010},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: transport
 # ---------------------------------------------------------------------------
@@ -322,6 +331,70 @@ def test_nodes_view_logs_out_when_the_key_is_rejected(
     assert resp.status_code == 302
     assert "/login" in resp.headers["Location"]
     assert webadmin_mod._sessions == {}
+
+
+# ---------------------------------------------------------------------------
+# /clients view
+# ---------------------------------------------------------------------------
+
+def test_mask_key_keeps_only_the_ends():
+    assert webadmin_mod._mask_key("fac72a9494cd132a") == "fac7...132a"
+
+
+def test_mask_key_handles_short_and_missing_values():
+    # Nothing to keep from a short secret, so reveal no characters
+    assert webadmin_mod._mask_key("abcd") == "****"
+    assert webadmin_mod._mask_key("abcdefgh") == "********"
+    assert webadmin_mod._mask_key(None) == ""
+    assert webadmin_mod._mask_key("") == ""
+
+
+def test_clients_view_requires_login(web_client):
+    assert web_client.get("/clients").status_code == 302
+
+
+def test_clients_view_masks_client_keys(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    calls = _stub_api(monkeypatch, _ok([_make_api_client()]))
+
+    resp = web_client.get("/clients")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+
+    assert calls == [("/conf/info/clients", {"admin-key": "admin-key-01"})]
+    assert "client-01" in body
+    # The mask is what the page shows first
+    assert "fac7...132a" in body
+
+
+def test_clients_view_shows_the_ports_range(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _ok([_make_api_client()]))
+
+    body = web_client.get("/clients").data.decode()
+    assert "5000-5010" in body
+    assert "tester" in body
+
+
+def test_clients_view_handles_a_client_without_a_ports_range(
+        web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    entry = _make_api_client()
+    entry["ports-range"] = {}
+    _stub_api(monkeypatch, _ok([entry]))
+
+    resp = web_client.get("/clients")
+    assert resp.status_code == 200
+    assert b"none" in resp.data
+
+
+def test_clients_view_handles_an_empty_list(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _ok([]))
+
+    resp = web_client.get("/clients")
+    assert resp.status_code == 200
+    assert b"no clients configured" in resp.data
 
 
 # ---------------------------------------------------------------------------
