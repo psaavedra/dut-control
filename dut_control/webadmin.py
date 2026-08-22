@@ -248,6 +248,15 @@ def clients():
     return render_template("clients.html", clients=rows)
 
 
+@app.route("/processes")
+@login_required
+def processes():
+    rows, failure = _fetch_list("/conf/info/processes")
+    if failure is not None:
+        return failure
+    return render_template("processes.html", processes=rows)
+
+
 @app.route("/logout", methods=["POST"])
 def logout():
     _drop_session()

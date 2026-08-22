@@ -517,6 +517,7 @@ A proxy is not a stylistic choice. Every dut-control endpoint accepts only `POST
 
 - **nodes and DUTs**: one table per node, with each DUT's pool, enabled state, and its network, storage and power sections rendered generically, so keys added to a node YAML file show up rather than being dropped
 - **clients**: configured clients with SSH details and tunnel port ranges
+- **ssh tunnel processes**: the tunnels the service holds open, with pid, ports in use, owning reservation token and the full ssh command
 
 A client key is enough to reserve DUTs, so the clients view masks each one (`fac7...132a`) until you expand it. Expanding puts the full key in that page, so treat it as you would `dut-control-admin clients` output.
 

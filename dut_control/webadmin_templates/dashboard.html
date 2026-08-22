@@ -10,5 +10,9 @@
     <a href="{{ url_for('clients') }}">clients</a>
     <p>Configured clients, their SSH details and tunnel port ranges.</p>
   </li>
+  <li>
+    <a href="{{ url_for('processes') }}">ssh tunnel processes</a>
+    <p>Tunnels the service is holding open, with pids and ports.</p>
+  </li>
 </ul>
 {% endblock %}

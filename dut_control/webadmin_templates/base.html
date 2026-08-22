@@ -33,6 +33,7 @@
     .menu a { font-weight: 600; }
     .menu p { margin: .2rem 0 0; color: #8888; font-size: .85rem; }
     .muted { color: #8888; }
+    td.wrap { word-break: break-all; max-width: 28rem; }
     button { font: inherit; padding: .25rem .6rem; }
     .note { color: #8888; font-size: .85rem; max-width: 44rem; }
     .badge { font-size: .75rem; padding: .1rem .4rem;
@@ -51,6 +52,7 @@
     <a href="{{ url_for('dashboard') }}">menu</a>
     <a href="{{ url_for('nodes') }}">nodes</a>
     <a href="{{ url_for('clients') }}">clients</a>
+    <a href="{{ url_for('processes') }}">processes</a>
   </nav>
   {% endblock %}
   <form method="post" action="{{ url_for('logout') }}"

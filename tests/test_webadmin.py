@@ -398,6 +398,62 @@ def test_clients_view_handles_an_empty_list(web_client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# /processes view
+# ---------------------------------------------------------------------------
+
+def _make_process(pid=12345, token="a1b2c3d4e5f60718", port=5000):
+    return {
+        "pid": pid,
+        "reserve-token": token,
+        "command": ("ssh -o StrictHostKeyChecking=no -N -p 22 "
+                    f"-R {port}:192.0.2.30:22 tester@192.0.2.10"),
+        "client-name": "client-01",
+        "ports-in-use": [port],
+    }
+
+
+def test_processes_view_requires_login(web_client):
+    assert web_client.get("/processes").status_code == 302
+
+
+def test_processes_view_lists_pids_and_ports(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    calls = _stub_api(monkeypatch, _ok([_make_process()]))
+
+    resp = web_client.get("/processes")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+
+    assert calls == [("/conf/info/processes",
+                      {"admin-key": "admin-key-01"})]
+    assert "12345" in body
+    assert "5000" in body
+    assert "a1b2c3d4e5f60718" in body
+    assert "client-01" in body
+    # The tunnel command is shown so a stuck tunnel can be identified
+    assert "192.0.2.30:22" in body
+
+
+def test_processes_view_lists_every_port_in_use(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    entry = _make_process()
+    entry["ports-in-use"] = [5000, 5001]
+    _stub_api(monkeypatch, _ok([entry]))
+
+    body = web_client.get("/processes").data.decode()
+    assert "5000" in body and "5001" in body
+
+
+def test_processes_view_handles_an_empty_list(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _ok([]))
+
+    resp = web_client.get("/processes")
+    assert resp.status_code == 200
+    assert b"no tunnel processes tracked" in resp.data
+
+
+# ---------------------------------------------------------------------------
 # Import hygiene
 # ---------------------------------------------------------------------------
 
