@@ -13,6 +13,7 @@ Core pieces:
 - **Flask service**: `dut_control.server`
 - **Client CLI**: `dut_control.client` (installed as `dut-control-client`)
 - **Admin CLI**: `dut_control.admin` (installed as `dut-control-admin`)
+- **Admin web UI**: `dut_control.webadmin` (installed as `dut-control-webadmin`)
 
 ## Features
 
@@ -73,7 +74,7 @@ To install with test extras:
 pip install ".[test]"
 ```
 
-This will install the `dut_control` package and the console entry points `dut-control`, `dut-control-client`, and `dut-control-admin`.
+This will install the `dut_control` package and the console entry points `dut-control`, `dut-control-client`, `dut-control-admin`, and `dut-control-webadmin`.
 
 ## Configuration
 
@@ -491,6 +492,58 @@ dut-control-admin prune
 dut-control-admin dut-disable rpi5-03
 dut-control-admin dut-enable rpi5-03
 ```
+
+### dut-control-webadmin
+
+`dut-control-webadmin` is a browser UI for the `/conf/...` admin endpoints. It is a **separate HTTP service**: it renders HTML and proxies every call to dut-control server side with `requests`, exactly as `dut-control-admin` does. It never imports the service module, so it can run on a different host.
+
+A proxy is not a stylistic choice. Every dut-control endpoint accepts only `POST`/`PUT`, takes its secret in the JSON body, and sends no CORS headers, so a browser cannot call the API directly at all.
+
+**Environment**:
+
+- `DUT_CONTROL_URL` (optional): base URL of the dut-control service (default `http://localhost:8000`)
+- `DUT_CONTROL_WEBADMIN_SECRET` (optional): Flask session signing key. When unset, a random one is generated per start, so logins do not survive a restart
+
+**Options**:
+
+- `-u, --url`: dut-control base URL (default uses `DUT_CONTROL_URL` or the built-in default)
+- `--host`: address to listen on (default `0.0.0.0`)
+- `--port`: port to listen on (default `8080`)
+- `--timeout`: HTTP timeout in seconds for API calls (default 10.0)
+
+**Authentication**: there is no admin key on the command line. Opening the UI shows a login form; the key is checked against the service and then held **server side**, keyed by an opaque session id. The browser cookie carries only that id, so the admin key is never sent to the browser and never crosses the network after login. Logging out, or a restart, drops it.
+
+**Actions**: the main menu offers a configuration reload, the reservations view offers a prune of expired records, and each DUT row on the nodes view has an enable or disable button. Disabling a DUT keeps it out of new reservations while leaving any it already has alone, and the change is in memory only, so a reload puts the YAML value back. Both are POST forms carrying a per-session CSRF token, and both redirect and report the outcome, so refreshing a page cannot repeat them. A prune reports how many records it removed and reminds you that tunnel processes are left running.
+
+**Main menu**: links to every view, each annotated with a live count (nodes, DUTs, disabled DUTs, clients, open tunnels, current reservations). This is the only page that calls several endpoints, and a count whose endpoint cannot be read shows `n/a` instead of failing the page.
+
+**Views**:
+
+- **nodes and DUTs**: one table per node, with each DUT's pool, enabled state, and its network, storage and power sections rendered generically, so keys added to a node YAML file show up rather than being dropped
+- **clients**: configured clients with SSH details and tunnel port ranges
+- **ssh tunnel processes**: the tunnels the service holds open, with pid, ports in use, owning reservation token and the full ssh command
+- **reservations**: every record with its state (active, future or expired), the DUT resolved to its node and pool, the client resolved to its name, a readable expiry, and whether a tunnel process still exists for it. A `show current only` toggle passes `active` to the endpoint
+
+Reservations are never deleted, only expired, so released ones stay listed until pruned; an active reservation with no tunnel, or a tunnel outliving its reservation, points at a leak. There is no admin endpoint to force-release a reservation, so the UI cannot offer one: that needs the owning client key through `/lease`.
+
+A client key is enough to reserve DUTs, so the clients view masks each one (`fac7...132a`) until you expand it. Expanding puts the full key in that page, so treat it as you would `dut-control-admin clients` output.
+
+**Example usage**:
+
+```bash
+export DUT_CONTROL_URL=http://lab-controller:8000
+export DUT_CONTROL_WEBADMIN_SECRET=$(openssl rand -hex 32)
+
+dut-control-webadmin --port 8080
+# then open http://localhost:8080/ and log in with the admin key
+```
+
+**Security notes**:
+
+- The service is an authenticated admin proxy. It binds `0.0.0.0` by default, matching `dut-control` itself, so restrict it to a trusted network or bind `--host 127.0.0.1`.
+- It runs with Flask debug off, deliberately: the Werkzeug debugger would expose an interactive console on a process holding the admin key.
+- State-changing requests carry a per-session CSRF token, and the session cookie is `HttpOnly` with `SameSite=Lax`.
+- A public login form is an online guessing oracle against the admin key; there is no rate limiting.
 
 ## Testing
 

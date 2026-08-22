@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, action_form %}
+{% block title %}reserves - dut-control admin{% endblock %}
+{% block content %}
+<h2>reservations</h2>
+<p>
+  {% if active %}
+    showing current reservations only
+    &middot; <a href="{{ url_for('reserves') }}">show all</a>
+  {% else %}
+    showing every record
+    &middot;
+    <a href="{{ url_for('reserves', active=1) }}">show current only</a>
+  {% endif %}
+</p>
+{{ action_form('action_prune', 'prune expired', csrf_token) }}
+{% if not reserves %}
+<p class="muted">no reservations recorded</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>state</th><th>DUT</th><th>node</th><th>pool</th>
+      <th>client</th><th>valid until</th><th>tunnel</th><th>token</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for entry in reserves %}
+    <tr>
+      <td>
+        {%- if entry['state'] == 'active' -%}
+          {{ badge('active', 'ok') }}
+        {%- elif entry['state'] == 'future' -%}
+          {{ badge('future', '') }}
+        {%- else -%}
+          {{ badge('expired', 'off') }}
+        {%- endif -%}
+      </td>
+      <td><strong>{{ entry['dut-name'] }}</strong></td>
+      <td>{{ entry['node'] or '<unknown>' }}</td>
+      <td>{{ entry['pool'] or '-' }}</td>
+      <td>
+        {{ entry['client-name'] or '<unknown>' }}
+        <details>
+          <summary class="muted">
+            <code>{{ entry['client-key'] | mask }}</code>
+          </summary>
+          <code>{{ entry['client-key'] }}</code>
+        </details>
+      </td>
+      <td>
+        {{ entry['valid-until'] | epoch }}
+        <div class="muted">{{ entry['valid-until'] | delta }}</div>
+      </td>
+      <td>
+        {%- if entry['tunnel'] -%}
+          {{ badge('open', 'ok') }}
+        {%- elif entry['state'] == 'active' -%}
+          {{ badge('missing', 'off') }}
+        {%- else -%}
+          <span class="muted">-</span>
+        {%- endif -%}
+      </td>
+      <td><code>{{ entry['token'] }}</code></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="note">
+  A reservation is never deleted, only expired, so released ones stay
+  listed until pruned. An active reservation with no tunnel, or a
+  tunnel left behind by an expired one, points at a leak. There is no
+  admin endpoint to force-release a reservation: that needs the owning
+  client key through /lease.
+</p>
+{% endif %}
+{% endblock %}

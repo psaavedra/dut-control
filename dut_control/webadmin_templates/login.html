@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}log in - dut-control admin{% endblock %}
+{% block content %}
+<h2>dut-control admin</h2>
+<form method="post" action="{{ url_for('login') }}">
+  <p>
+    <label for="admin-key">admin key</label><br>
+    <input id="admin-key" name="admin-key" type="password"
+           autocomplete="current-password" autofocus size="40">
+  </p>
+  <button type="submit">log in</button>
+</form>
+<p class="note">
+  The key is checked against {{ base_url }} and kept on the server for
+  this session only; it is never stored in the browser.
+</p>
+{% endblock %}
