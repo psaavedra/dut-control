@@ -13,6 +13,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 from functools import wraps
 
 import requests
@@ -176,7 +177,92 @@ def _mask_key(value, keep: int = 4) -> str:
     return f"{text[:keep]}...{text[-keep:]}"
 
 
+def _fmt_span(seconds: int) -> str:
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _fmt_epoch(value) -> str:
+    """
+    Render a unix timestamp. Reserve records come back over HTTP as
+    open-ended dicts, so a missing or non-numeric value must not raise
+    inside a template.
+    """
+    try:
+        stamp = int(value)
+    except (TypeError, ValueError):
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+
+
+def _fmt_delta(value) -> str:
+    """Same value as _fmt_epoch, expressed relative to now."""
+    try:
+        stamp = int(value)
+    except (TypeError, ValueError):
+        return ""
+    delta = stamp - int(time.time())
+    if delta >= 0:
+        return f"in {_fmt_span(delta)}"
+    return f"{_fmt_span(-delta)} ago"
+
+
 app.jinja_env.filters["mask"] = _mask_key
+app.jinja_env.filters["epoch"] = _fmt_epoch
+app.jinja_env.filters["delta"] = _fmt_delta
+
+
+# ---------------------------------------------------------------------------
+# Derivations
+# ---------------------------------------------------------------------------
+
+def _index_duts(node_rows) -> dict:
+    """Map every DUT name to the node hosting it and its pool."""
+    index = {}
+    for node in node_rows:
+        for dut in node.get("duts", []):
+            index[dut.get("name")] = {
+                "node": node.get("name"),
+                "pool": dut.get("metadata", {}).get("pool"),
+            }
+    return index
+
+
+def _index_clients(client_rows) -> dict:
+    return {row.get("key"): row.get("name") for row in client_rows}
+
+
+def _reserve_state(entry: dict, now: int) -> str:
+    """
+    Classify a reserve record.
+
+    The API never deletes reservations: releasing one sets valid-until
+    to now, so expired rows pile up until they are pruned and "active"
+    is a property to compute rather than read.
+    """
+    if entry.get("valid-until", 0) < now:
+        return "expired"
+    if entry.get("valid-from", 0) > now:
+        return "future"
+    return "active"
+
+
+def _decorate_reserves(rows, duts, names, tunnels, now):
+    """Attach node, pool, client name, state and tunnel presence."""
+    out = []
+    for entry in rows:
+        item = dict(entry)
+        place = duts.get(entry.get("dut-name")) or {}
+        item["node"] = place.get("node")
+        item["pool"] = place.get("pool")
+        item["client-name"] = names.get(entry.get("client-key"))
+        item["state"] = _reserve_state(entry, now)
+        item["tunnel"] = entry.get("token") in tunnels
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +316,17 @@ def _fetch_list(path: str, extra: dict = None):
     return result["data"] or [], None
 
 
+def _fetch_lookup(path: str):
+    """
+    Read an endpoint used only to label another view.
+
+    Failures degrade to no rows rather than blanking the page: losing
+    the node names is better than losing the reservations.
+    """
+    result = _admin_post(path)
+    return result["data"] or [] if result["ok"] else []
+
+
 @app.route("/nodes")
 @login_required
 def nodes():
@@ -255,6 +352,26 @@ def processes():
     if failure is not None:
         return failure
     return render_template("processes.html", processes=rows)
+
+
+@app.route("/reserves")
+@login_required
+def reserves():
+    active = bool(request.args.get("active"))
+    rows, failure = _fetch_list(
+        "/conf/info/reserves", {"active": True} if active else None)
+    if failure is not None:
+        return failure
+    tunnels = {row.get("reserve-token")
+               for row in _fetch_lookup("/conf/info/processes")}
+    items = _decorate_reserves(
+        rows,
+        _index_duts(_fetch_lookup("/conf/info/nodes")),
+        _index_clients(_fetch_lookup("/conf/info/clients")),
+        tunnels,
+        int(time.time()),
+    )
+    return render_template("reserves.html", reserves=items, active=active)
 
 
 @app.route("/logout", methods=["POST"])

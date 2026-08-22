@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+import time
 
 import dut_control.webadmin as webadmin_mod
 import pytest
@@ -109,6 +110,30 @@ def _make_api_client(name="client-01", key="fac72a9494cd132a"):
         "key": key,
         "ssh": {"ip": "192.0.2.10", "port": 22, "user": "tester"},
         "ports-range": {"from": 5000, "to": 5010},
+    }
+
+
+def _stub_api_paths(monkeypatch, mapping, calls=None):
+    """Route _api_post per endpoint; unlisted paths return no rows."""
+    calls = [] if calls is None else calls
+
+    def fake(path, payload):
+        calls.append((path, payload))
+        return mapping.get(path, _ok([]))
+
+    monkeypatch.setattr(webadmin_mod, "_api_post", fake)
+    return calls
+
+
+def _make_reserve(token="tok-1", dut="rpi5-01", key="fac72a9494cd132a",
+                  frm=-10, until=3600):
+    now = int(time.time())
+    return {
+        "token": token,
+        "valid-from": now + frm,
+        "valid-until": now + until,
+        "client-key": key,
+        "dut-name": dut,
     }
 
 
@@ -451,6 +476,157 @@ def test_processes_view_handles_an_empty_list(web_client, monkeypatch):
     resp = web_client.get("/processes")
     assert resp.status_code == 200
     assert b"no tunnel processes tracked" in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Reserve derivations
+# ---------------------------------------------------------------------------
+
+def test_reserve_state_classifies_by_timestamps():
+    now = 1000
+    assert webadmin_mod._reserve_state(
+        {"valid-from": 900, "valid-until": 1100}, now) == "active"
+    assert webadmin_mod._reserve_state(
+        {"valid-from": 900, "valid-until": 999}, now) == "expired"
+    assert webadmin_mod._reserve_state(
+        {"valid-from": 1001, "valid-until": 2000}, now) == "future"
+    # A released reservation has valid-until set to exactly now
+    assert webadmin_mod._reserve_state(
+        {"valid-from": 900, "valid-until": 1000}, now) == "active"
+
+
+def test_index_duts_maps_names_to_node_and_pool():
+    nodes = [_make_node("node-a", duts=[_make_dut("d1", pool="p1")]),
+             _make_node("node-b", duts=[_make_dut("d2", pool="p2")])]
+    index = webadmin_mod._index_duts(nodes)
+    assert index["d1"] == {"node": "node-a", "pool": "p1"}
+    assert index["d2"] == {"node": "node-b", "pool": "p2"}
+
+
+def test_decorate_reserves_flags_a_missing_tunnel():
+    """An active reservation with no tunnel process is a leak."""
+    now = int(time.time())
+    rows = [_make_reserve("with-tunnel"), _make_reserve("without-tunnel")]
+    items = webadmin_mod._decorate_reserves(
+        rows, {}, {}, {"with-tunnel"}, now)
+    by_token = {item["token"]: item for item in items}
+    assert by_token["with-tunnel"]["tunnel"] is True
+    assert by_token["without-tunnel"]["tunnel"] is False
+
+
+def test_fmt_epoch_handles_missing_values():
+    assert webadmin_mod._fmt_epoch(None) == "-"
+    assert webadmin_mod._fmt_epoch("nonsense") == "-"
+    assert "1970" in webadmin_mod._fmt_epoch(0)
+
+
+def test_fmt_delta_reports_past_and_future():
+    now = int(time.time())
+    assert webadmin_mod._fmt_delta(now + 7200).startswith("in 2h")
+    assert webadmin_mod._fmt_delta(now - 120).endswith("ago")
+    assert webadmin_mod._fmt_delta(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# /reserves view
+# ---------------------------------------------------------------------------
+
+def test_reserves_view_requires_login(web_client):
+    assert web_client.get("/reserves").status_code == 302
+
+
+def test_reserves_view_joins_dut_to_node_and_client(
+        web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    node = _make_node("node-01", duts=[_make_dut("rpi5-01", pool="rpi5")])
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/reserves": _ok([_make_reserve(dut="rpi5-01")]),
+        "/conf/info/nodes": _ok([node]),
+        "/conf/info/clients": _ok([_make_api_client()]),
+    })
+
+    body = web_client.get("/reserves").data.decode()
+    assert "rpi5-01" in body
+    # dut-name resolved to its node and pool, client-key to its name
+    assert "node-01" in body
+    assert "rpi5" in body
+    assert "client-01" in body
+
+
+def test_reserves_view_active_filter_passes_the_flag(
+        web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    calls = _stub_api_paths(monkeypatch, {})
+
+    web_client.get("/reserves?active=1")
+    reserve_calls = [c for c in calls if c[0] == "/conf/info/reserves"]
+    assert reserve_calls[0][1]["active"] is True
+
+    calls.clear()
+    web_client.get("/reserves")
+    reserve_calls = [c for c in calls if c[0] == "/conf/info/reserves"]
+    assert "active" not in reserve_calls[0][1]
+
+
+def test_reserves_view_marks_expired_entries(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/reserves": _ok([
+            _make_reserve("live"),
+            _make_reserve("gone", frm=-7200, until=-3600),
+        ]),
+    })
+
+    body = web_client.get("/reserves").data.decode()
+    assert "expired" in body
+    assert "active" in body
+
+
+def test_reserves_view_masks_the_client_key(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/reserves": _ok([_make_reserve()]),
+    })
+
+    body = web_client.get("/reserves").data.decode()
+    assert "fac7...132a" in body
+
+
+def test_reserves_view_survives_an_unknown_dut(web_client, monkeypatch):
+    """A reservation can outlive the DUT being renamed in the YAML."""
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/reserves": _ok([_make_reserve(dut="ghost-01")]),
+    })
+
+    resp = web_client.get("/reserves")
+    assert resp.status_code == 200
+    assert b"ghost-01" in resp.data
+    assert b"unknown" in resp.data
+
+
+def test_reserves_view_renders_when_lookups_fail(web_client, monkeypatch):
+    """Losing the node names must not blank out the reservations."""
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/reserves": _ok([_make_reserve(dut="rpi5-01")]),
+        "/conf/info/nodes": _fail("boom"),
+        "/conf/info/clients": _fail("boom"),
+        "/conf/info/processes": _fail("boom"),
+    })
+
+    resp = web_client.get("/reserves")
+    assert resp.status_code == 200
+    assert b"rpi5-01" in resp.data
+
+
+def test_reserves_view_handles_an_empty_list(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {})
+
+    resp = web_client.get("/reserves")
+    assert resp.status_code == 200
+    assert b"no reservations recorded" in resp.data
 
 
 # ---------------------------------------------------------------------------
