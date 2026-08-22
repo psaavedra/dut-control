@@ -4,6 +4,7 @@ import os
 import random
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -840,6 +841,24 @@ def _image_stream_command(node_tmp_path: str):
     return None
 
 
+def _bmap_path_for_image(image_path: str):
+    """
+    Path of the .bmap file conventionally shipped next to an image: the
+    compression suffix is dropped and .bmap appended, so
+    foo.wic.bz2 -> foo.wic.bmap and foo.wic -> foo.wic.bmap.
+
+    Returns None for compressed tarballs, where the name of the image
+    inside the archive (and hence its bmap) is not derivable.
+    """
+    name = image_path.lower()
+    for ext in _IMAGE_DECOMPRESSORS:
+        if name.endswith(ext):
+            if name.endswith(".tar" + ext):
+                return None
+            return image_path[:-len(ext)] + ".bmap"
+    return image_path + ".bmap"
+
+
 def _flash_verify_command(node_tmp_path: str, device: str) -> str:
     """
     Shell command run on the node to check the device actually holds the
@@ -888,19 +907,27 @@ def _get_node_flash_lock(node_name: str):
 
 
 def _flash_and_verify_on_node(
-        node: dict, control: str, device: str, node_tmp_path: str):
+        node: dict, control: str, device: str, node_tmp_path: str,
+        node_bmap_path: str = None):
     """
     Expose the SD card to the node, flash the image, read the device back
     to check it holds the image, and hand the card back to the DUT.
 
     Only one call runs per node at a time; a concurrent call for the
     same node blocks here until the in-progress one finishes.
+
+    With a bmap, bmaptool copies only the blocks the bmap maps and
+    checksums them against it while writing. The whole-image read-back
+    is then skipped: unmapped areas of the device keep whatever they
+    held before, so a linear comparison would never match.
     """
     with _get_node_flash_lock(node["name"]):
+        bmap_arg = ("--bmap " + shlex.quote(node_bmap_path)
+                    if node_bmap_path else "--nobmap")
         flash_cmd = (
             f"usbsdmux {shlex.quote(control)} host && "
             f"sleep {_USBSDMUX_SETTLE_DELAY} && "
-            f"bmaptool copy --nobmap "
+            f"bmaptool copy {bmap_arg} "
             f"{shlex.quote(node_tmp_path)} {shlex.quote(device)}"
         )
         if not _run_node_command(node, flash_cmd):
@@ -911,8 +938,10 @@ def _flash_and_verify_on_node(
         # left in a known state. A failed switch-back is reported ahead
         # of a checksum mismatch: a mux stuck on host needs operator
         # action first.
-        verified = _run_node_command(
-            node, _flash_verify_command(node_tmp_path, device))
+        verified = True
+        if not node_bmap_path:
+            verified = _run_node_command(
+                node, _flash_verify_command(node_tmp_path, device))
         switched = _run_node_command(
             node, f"usbsdmux {shlex.quote(control)} dut")
         if not switched:
@@ -925,12 +954,85 @@ def _flash_and_verify_on_node(
                 "match the image")
 
 
+def _run_scp(source: str, dest: str, port: int) -> bool:
+    """Copy one file with scp; True when it exits 0."""
+    cmd = ["scp", *_SSH_SKIP_HOST_CHECK, "-P", str(port), source, dest]
+    res = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return res.returncode == 0
+
+
+def _remote_spec(ssh: dict, path: str) -> str:
+    """
+    scp remote file spec (user@host:path). Remote scp paths go through
+    the remote shell, so the path is quoted to keep it a single plain
+    argument.
+    """
+    return f"{ssh.get('user', 'root')}@{ssh['ip']}:{shlex.quote(path)}"
+
+
+def _stage_optional_bmap(client: dict, node: dict, client_path: str,
+                         tmpdir: str, unique_suffix: str):
+    """
+    Best-effort staging of the .bmap file shipped next to the image
+    (client -> service -> node). Returns the node-side path, or None
+    when the image has no bmap or it could not be staged, in which case
+    the flash falls back to --nobmap.
+
+    A partial local copy left by a failed scp needs no handling here:
+    it lives in tmpdir, which the caller removes wholesale.
+    """
+    bmap_client_path = _bmap_path_for_image(client_path)
+    if not bmap_client_path:
+        return None
+
+    bmap_name = os.path.basename(bmap_client_path)
+    local_path = str(Path(tmpdir) / bmap_name)
+    node_path = f"/tmp/{unique_suffix}-{bmap_name}"
+
+    client_ssh = client["ssh"]
+    if not _run_scp(_remote_spec(client_ssh, bmap_client_path), local_path,
+                    int(client_ssh.get("port", 22))):
+        return None
+
+    node_ssh = node["ssh"]
+    if not _run_scp(local_path, _remote_spec(node_ssh, node_path),
+                    int(node_ssh.get("port", 22))):
+        # A failed push can still leave a partial copy on the node
+        _run_node_command(node, f"rm -f {shlex.quote(node_path)}")
+        return None
+
+    return node_path
+
+
+def _cleanup_flash_temps(node: dict, tmpdir: str, node_paths):
+    """
+    Best-effort removal of the staged image/bmap copies.
+
+    The local side is swept whole rather than by known path: a failed
+    scp can leave a partial file behind, which would keep the directory
+    alive and leak one temp dir per flash. tmpdir always comes from
+    mkdtemp() and only ever holds copies we staged there.
+    """
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    remote = " ".join(shlex.quote(p) for p in node_paths if p)
+    if remote:
+        _run_node_command(node, f"rm -f {remote}")
+
+
 def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
     """
     1. scp image from client -> service temp dir
-    2. scp image from service temp dir -> node temp dir
+    2. scp image from service temp dir -> node temp dir, together with
+       the matching .bmap file when the image ships one
     3. ssh to node: run usbsdmux/bmaptool using storage info, then read
        the device back and compare checksums to confirm the flash took
+       (read-back skipped for bmap copies, see _flash_and_verify_on_node)
 
     Requires passwordless SSH/SCP from the service host to both client and
     node.
@@ -943,14 +1045,7 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
         raise RuntimeError("storage.control/device missing in config")
 
     client_ssh = client["ssh"]
-    client_ip = client_ssh["ip"]
-    client_user = client_ssh.get("user", "root")
-    client_port = int(client_ssh.get("port", 22))
-
     node_ssh = node["ssh"]
-    node_ip = node_ssh["ip"]
-    node_user = node_ssh.get("user", "root")
-    node_port = int(node_ssh.get("port", 22))
 
     # Normalize basename once; we reuse it for local and remote tmp paths
     image_name = os.path.basename(client_path)
@@ -964,74 +1059,40 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
     unique_suffix = Path(tmpdir).name
     local_tmp_path = str(Path(tmpdir) / image_name)
     node_tmp_path = f"/tmp/{unique_suffix}-{image_name}"
+    node_bmap_path = None
 
     try:
         # 1) scp from client -> local temp dir
-        #    scp -P <client_port> user@client_ip:/remote/path /local/tmp/path
-        #    Remote scp paths go through the remote shell, so quote the
-        #    request-provided path to keep it a single plain argument.
-        scp_from_client = [
-            "scp",
-            *_SSH_SKIP_HOST_CHECK,
-            "-P",
-            str(client_port),
-            f"{client_user}@{client_ip}:{shlex.quote(client_path)}",
-            local_tmp_path,
-        ]
-        res = subprocess.run(
-            scp_from_client,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if res.returncode != 0:
+        if not _run_scp(_remote_spec(client_ssh, client_path), local_tmp_path,
+                        int(client_ssh.get("port", 22))):
             raise RuntimeError("scp from client failed")
 
         # 2) scp from local temp dir -> node temp dir
-        #    scp -P <node_port> /local/tmp/path user@node_ip:/tmp/image.wic
-        scp_to_node = [
-            "scp",
-            *_SSH_SKIP_HOST_CHECK,
-            "-P",
-            str(node_port),
-            local_tmp_path,
-            f"{node_user}@{node_ip}:{shlex.quote(node_tmp_path)}",
-        ]
-        res = subprocess.run(
-            scp_to_node,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if res.returncode != 0:
+        if not _run_scp(local_tmp_path, _remote_spec(node_ssh, node_tmp_path),
+                        int(node_ssh.get("port", 22))):
             raise RuntimeError("scp to node failed")
+
+        # 2b) Bring the .bmap along when the image has one: bmaptool then
+        #     copies only the mapped blocks, which is much faster and
+        #     checksums the copied data against the bmap.
+        node_bmap_path = _stage_optional_bmap(
+            client, node, client_path, tmpdir, unique_suffix)
 
         # 3) ssh to node: flash, verify device content, hand back to DUT.
         #    A failure here points at a bad card/mux on this DUT, so take
         #    it out of rotation; an operator can re-enable it via
         #    /conf/dut/enabled or a config reload.
         try:
-            _flash_and_verify_on_node(node, control, device, node_tmp_path)
+            _flash_and_verify_on_node(
+                node, control, device, node_tmp_path, node_bmap_path)
         except Exception:
             with state_lock:
                 dut.setdefault("metadata", {})["enabled"] = False
             raise
 
     finally:
-        # Best-effort cleanup of local temp file/dir
-        try:
-            if os.path.exists(local_tmp_path):
-                os.remove(local_tmp_path)
-        except OSError:
-            pass
-        try:
-            os.rmdir(tmpdir)
-        except OSError:
-            # directory not empty or already removed; ignore
-            pass
-
-        # Best-effort cleanup of the node temp file
-        _run_node_command(node, f"rm -f {shlex.quote(node_tmp_path)}")
+        _cleanup_flash_temps(
+            node, tmpdir, (node_tmp_path, node_bmap_path))
 
 
 @server.route("/flash", methods=["POST", "PUT"])
