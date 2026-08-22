@@ -75,6 +75,34 @@ def _log_in(web_client, monkeypatch, key="admin-key-01"):
         return sess["csrf"]
 
 
+def _stub_api(monkeypatch, result, calls=None):
+    """Point _api_post at a canned result and return the call log."""
+    calls = [] if calls is None else calls
+    monkeypatch.setattr(webadmin_mod, "_api_post",
+                        _api_returning(result, calls))
+    return calls
+
+
+def _make_node(name="node-01", duts=None):
+    return {
+        "name": name,
+        "ssh": {"ip": "192.0.2.20", "port": 22, "user": "runner"},
+        "duts": duts if duts is not None else [],
+    }
+
+
+def _make_dut(name="rpi5-01", pool="rpi5", enabled=True):
+    return {
+        "name": name,
+        "metadata": {"pool": pool, "enabled": enabled},
+        "network": {"ip": "192.0.2.30", "ssh-port": 22},
+        "storage": {"driver": "usbsdmux", "control": "/dev/sg1",
+                    "device": "/dev/sda1"},
+        "power": {"driver": "script", "power-on": "up.sh",
+                  "power-off": "down.sh"},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: transport
 # ---------------------------------------------------------------------------
@@ -218,6 +246,82 @@ def test_post_with_a_wrong_csrf_token_is_rejected(web_client, monkeypatch):
     resp = web_client.post("/logout", data={"csrf": "forged"})
     assert resp.status_code == 400
     assert list(webadmin_mod._sessions.values()) == ["admin-key-01"]
+
+
+# ---------------------------------------------------------------------------
+# /nodes view
+# ---------------------------------------------------------------------------
+
+def test_nodes_view_requires_login(web_client):
+    resp = web_client.get("/nodes")
+    assert resp.status_code == 302
+    assert "/login" in resp.headers["Location"]
+
+
+def test_nodes_view_lists_duts_per_node(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    node = _make_node(duts=[_make_dut("rpi5-01"),
+                            _make_dut("rpi5-02", enabled=False)])
+    calls = _stub_api(monkeypatch, _ok([node]))
+
+    resp = web_client.get("/nodes")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+
+    # The admin key is injected into the request the view makes
+    assert calls == [("/conf/info/nodes",
+                      {"admin-key": "admin-key-01"})]
+
+    assert "node-01" in body
+    assert "rpi5-01" in body and "rpi5-02" in body
+    assert "rpi5" in body
+    # The disabled DUT is marked as such
+    assert "disabled" in body
+
+
+def test_nodes_view_renders_open_ended_dut_fields(web_client, monkeypatch):
+    """Sub-dicts come straight from YAML, so unknown keys must show up."""
+    _log_in(web_client, monkeypatch)
+    dut = _make_dut()
+    dut["metadata"]["site"] = "rack-7"
+    dut["storage"]["surprise"] = "value-42"
+    _stub_api(monkeypatch, _ok([_make_node(duts=[dut])]))
+
+    body = web_client.get("/nodes").data.decode()
+    assert "surprise" in body and "value-42" in body
+    assert "/dev/sg1" in body
+
+
+def test_nodes_view_handles_an_empty_inventory(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _ok([]))
+
+    resp = web_client.get("/nodes")
+    assert resp.status_code == 200
+    assert b"no nodes configured" in resp.data
+
+
+def test_nodes_view_reports_a_service_error(web_client, monkeypatch):
+    """A reachable service that errors still renders a usable page."""
+    _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _fail("cannot reach dut-control at x"))
+
+    resp = web_client.get("/nodes")
+    assert resp.status_code == 200
+    assert b"cannot reach dut-control" in resp.data
+
+
+def test_nodes_view_logs_out_when_the_key_is_rejected(
+        web_client, monkeypatch):
+    """A key revoked mid session must not leave a half-working UI."""
+    _log_in(web_client, monkeypatch)
+    _stub_api(monkeypatch, _fail("the service rejected the admin key",
+                                 auth=True))
+
+    resp = web_client.get("/nodes")
+    assert resp.status_code == 302
+    assert "/login" in resp.headers["Location"]
+    assert webadmin_mod._sessions == {}
 
 
 # ---------------------------------------------------------------------------

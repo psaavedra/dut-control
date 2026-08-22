@@ -35,6 +35,10 @@
     .muted { color: #8888; }
     button { font: inherit; padding: .25rem .6rem; }
     .note { color: #8888; font-size: .85rem; max-width: 44rem; }
+    .badge { font-size: .75rem; padding: .1rem .4rem;
+             border: 1px solid #8886; border-radius: .2rem; }
+    .badge.ok { border-color: #2a2; }
+    .badge.off { border-color: #c33; }
   </style>
 </head>
 <body>
@@ -45,6 +49,7 @@
   {% block nav %}
   <nav>
     <a href="{{ url_for('dashboard') }}">menu</a>
+    <a href="{{ url_for('nodes') }}">nodes</a>
   </nav>
   {% endblock %}
   <form method="post" action="{{ url_for('logout') }}"

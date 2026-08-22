@@ -87,6 +87,13 @@ def _api_post(path: str, payload: dict):
     return _classify(resp)
 
 
+def _admin_post(path: str, extra: dict = None):
+    """POST with the logged in admin key injected into the body."""
+    payload = {"admin-key": _session_key()}
+    payload.update(extra or {})
+    return _api_post(path, payload)
+
+
 # ---------------------------------------------------------------------------
 # Sessions and access control
 # ---------------------------------------------------------------------------
@@ -114,6 +121,13 @@ def _drop_session() -> None:
         with _sessions_lock:
             _sessions.pop(sid, None)
     session.clear()
+
+
+def _auth_failed():
+    """Handle a key the service stopped accepting mid session."""
+    _drop_session()
+    flash("the admin key was rejected; log in again", "error")
+    return redirect(url_for("login"))
 
 
 def login_required(func):
@@ -175,6 +189,33 @@ def login():
             return failure
         return redirect(url_for("dashboard"))
     return render_template("login.html")
+
+
+def _fetch_list(path: str, extra: dict = None):
+    """
+    Read a list endpoint.
+
+    Returns (rows, failure). `failure` is a response to return as is
+    when the session must end; a reachable service that answered with
+    an error yields empty rows and a flashed message instead, so the
+    page still renders its navigation.
+    """
+    result = _admin_post(path, extra)
+    if result["auth"]:
+        return [], _auth_failed()
+    if not result["ok"]:
+        flash(result["error"], "error")
+        return [], None
+    return result["data"] or [], None
+
+
+@app.route("/nodes")
+@login_required
+def nodes():
+    rows, failure = _fetch_list("/conf/info/nodes")
+    if failure is not None:
+        return failure
+    return render_template("nodes.html", nodes=rows)
 
 
 @app.route("/logout", methods=["POST"])

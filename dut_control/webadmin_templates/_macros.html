@@ -1,0 +1,14 @@
+{# Render an open-ended mapping, so YAML keys the service passes
+   through are never silently dropped by the UI. #}
+{% macro kv(mapping) %}
+{%- if mapping %}
+  {%- for key, value in mapping.items() %}
+<div><span class="muted">{{ key }}:</span> <code>{{ value }}</code></div>
+  {%- endfor %}
+{%- else %}<span class="muted">none</span>
+{%- endif %}
+{% endmacro %}
+
+{% macro badge(text, kind) %}
+<span class="badge {{ kind }}">{{ text }}</span>
+{%- endmacro %}
