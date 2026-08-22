@@ -24,3 +24,11 @@
   <button type="submit">{{ label }}</button>
 </form>
 {%- endmacro %}
+
+{# A count that may be unavailable, so one failed call greys out one
+   number rather than blanking the page. #}
+{% macro num(value) %}
+{%- if value is none -%}<span class="muted">n/a</span>
+{%- else -%}<strong>{{ value }}</strong>
+{%- endif -%}
+{% endmacro %}

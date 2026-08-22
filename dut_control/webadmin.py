@@ -343,6 +343,49 @@ def _fetch_list(path: str, extra: dict = None):
     return _as_rows(result["data"]), None
 
 
+def _count(rows):
+    """Length of a row list, or None when it could not be read."""
+    return None if rows is None else len(rows)
+
+
+def _rows_or_none(path: str):
+    """Rows from a summary endpoint, or None when the call failed."""
+    result = _admin_post(path)
+    return _as_rows(result["data"]) if result["ok"] else None
+
+
+def _summary_counts() -> dict:
+    """
+    Counts for the menu page.
+
+    Each value is None when its endpoint could not be read, so one
+    unreachable call greys out one number instead of failing the whole
+    page. This is the only view that needs several calls.
+    """
+    node_rows = _rows_or_none("/conf/info/nodes")
+    reserve_rows = _rows_or_none("/conf/info/reserves")
+    counts = {
+        "nodes": _count(node_rows),
+        "clients": _count(_rows_or_none("/conf/info/clients")),
+        "tunnels": _count(_rows_or_none("/conf/info/processes")),
+        "duts": None,
+        "disabled": None,
+        "active": None,
+    }
+    if node_rows is not None:
+        duts = [d for node in node_rows for d in node.get("duts", [])]
+        counts["duts"] = len(duts)
+        counts["disabled"] = sum(
+            1 for dut in duts
+            if not dut.get("metadata", {}).get("enabled", True))
+    if reserve_rows is not None:
+        now = int(time.time())
+        counts["active"] = sum(
+            1 for row in reserve_rows
+            if _reserve_state(row, now) == "active")
+    return counts
+
+
 def _fetch_lookup(path: str):
     """
     Read an endpoint used only to label another view.
@@ -479,7 +522,7 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    return render_template("dashboard.html")
+    return render_template("dashboard.html", counts=_summary_counts())
 
 
 # ---------------------------------------------------------------------------

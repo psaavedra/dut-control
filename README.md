@@ -515,6 +515,8 @@ A proxy is not a stylistic choice. Every dut-control endpoint accepts only `POST
 
 **Actions**: the main menu offers a configuration reload, the reservations view offers a prune of expired records, and each DUT row on the nodes view has an enable or disable button. Disabling a DUT keeps it out of new reservations while leaving any it already has alone, and the change is in memory only, so a reload puts the YAML value back. Both are POST forms carrying a per-session CSRF token, and both redirect and report the outcome, so refreshing a page cannot repeat them. A prune reports how many records it removed and reminds you that tunnel processes are left running.
 
+**Main menu**: links to every view, each annotated with a live count (nodes, DUTs, disabled DUTs, clients, open tunnels, current reservations). This is the only page that calls several endpoints, and a count whose endpoint cannot be read shows `n/a` instead of failing the page.
+
 **Views**:
 
 - **nodes and DUTs**: one table per node, with each DUT's pool, enabled state, and its network, storage and power sections rendered generically, so keys added to a node YAML file show up rather than being dropped

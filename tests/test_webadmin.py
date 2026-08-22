@@ -659,7 +659,9 @@ def test_reload_action_flashes_success(web_client, monkeypatch):
     resp = web_client.post("/actions/reload", data={"csrf": token},
                            follow_redirects=True)
     assert resp.status_code == 200
-    assert calls == [("/conf/reload", {"admin-key": "admin-key-01"})]
+    # The reload is the first call; the menu it redirects to then
+    # fetches its own counters.
+    assert calls[0] == ("/conf/reload", {"admin-key": "admin-key-01"})
     assert b"configuration reloaded" in resp.data
 
 
@@ -835,6 +837,98 @@ def test_nodes_view_offers_the_matching_toggle(web_client, monkeypatch):
     assert ">disable<" in body
     assert ">enable<" in body
     assert 'value="on-01"' in body and 'value="off-01"' in body
+
+
+# ---------------------------------------------------------------------------
+# Dashboard counters
+# ---------------------------------------------------------------------------
+
+def test_summary_counts_counts_duts_and_disabled(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    node = _make_node(duts=[_make_dut("a"), _make_dut("b"),
+                            _make_dut("c", enabled=False)])
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/nodes": _ok([node]),
+        "/conf/info/clients": _ok([_make_api_client()]),
+        "/conf/info/processes": _ok([_make_process()]),
+        "/conf/info/reserves": _ok([
+            _make_reserve("live"),
+            _make_reserve("gone", frm=-7200, until=-3600),
+        ]),
+    })
+
+    counts = _counts_from(monkeypatch, web_client)
+    assert counts["nodes"] == 1
+    assert counts["duts"] == 3
+    assert counts["disabled"] == 1
+    assert counts["clients"] == 1
+    assert counts["tunnels"] == 1
+    # Only the unexpired reservation counts as current
+    assert counts["active"] == 1
+
+
+def _counts_from(monkeypatch, web_client):
+    """Call _summary_counts inside a session-bearing request."""
+    holder = {}
+    real = webadmin_mod._summary_counts
+
+    def capture():
+        holder["counts"] = real()
+        return holder["counts"]
+
+    monkeypatch.setattr(webadmin_mod, "_summary_counts", capture)
+    web_client.get("/")
+    monkeypatch.setattr(webadmin_mod, "_summary_counts", real)
+    return holder["counts"]
+
+
+def test_dashboard_shows_counts(web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/nodes": _ok([_make_node(duts=[_make_dut()])]),
+        "/conf/info/clients": _ok([_make_api_client()]),
+    })
+
+    resp = web_client.get("/")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "nodes" in body and "DUTs" in body
+    assert "<strong>1</strong>" in body
+
+
+def test_dashboard_degrades_when_one_endpoint_fails(
+        web_client, monkeypatch):
+    """One dead endpoint must grey out one number, not break the page."""
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/nodes": _fail("cannot reach dut-control at x"),
+        "/conf/info/clients": _ok([_make_api_client()]),
+        "/conf/info/processes": _ok([]),
+        "/conf/info/reserves": _ok([_make_reserve()]),
+    })
+
+    resp = web_client.get("/")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "n/a" in body
+    # The readable endpoints still report their numbers
+    assert "<strong>1</strong>" in body
+    assert "<strong>0</strong>" in body
+
+
+def test_dashboard_counts_are_all_unavailable_when_offline(
+        web_client, monkeypatch):
+    _log_in(web_client, monkeypatch)
+    _stub_api_paths(monkeypatch, {
+        "/conf/info/nodes": _fail("down"),
+        "/conf/info/clients": _fail("down"),
+        "/conf/info/processes": _fail("down"),
+        "/conf/info/reserves": _fail("down"),
+    })
+
+    resp = web_client.get("/")
+    assert resp.status_code == 200
+    assert resp.data.decode().count("n/a") == 6
 
 
 # ---------------------------------------------------------------------------

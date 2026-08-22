@@ -1,23 +1,34 @@
 {% extends "base.html" %}
-{% from "_macros.html" import action_form %}
+{% from "_macros.html" import action_form, num %}
 {% block content %}
 <h2>admin views</h2>
 <ul class="menu">
   <li>
     <a href="{{ url_for('nodes') }}">nodes and DUTs</a>
-    <p>Lab hosts, their DUTs, pools and per-DUT configuration.</p>
+    <p>
+      {{ num(counts['nodes']) }} nodes, {{ num(counts['duts']) }} DUTs,
+      {{ num(counts['disabled']) }} disabled.
+    </p>
   </li>
   <li>
     <a href="{{ url_for('clients') }}">clients</a>
-    <p>Configured clients, their SSH details and tunnel port ranges.</p>
+    <p>
+      {{ num(counts['clients']) }} configured, with their SSH details
+      and tunnel port ranges.
+    </p>
   </li>
   <li>
     <a href="{{ url_for('processes') }}">ssh tunnel processes</a>
-    <p>Tunnels the service is holding open, with pids and ports.</p>
+    <p>
+      {{ num(counts['tunnels']) }} open, with pids and ports.
+    </p>
   </li>
   <li>
     <a href="{{ url_for('reserves') }}">reservations</a>
-    <p>Reservations with their DUT, node, pool, client and expiry.</p>
+    <p>
+      {{ num(counts['active']) }} current, with DUT, node, pool, client
+      and expiry.
+    </p>
   </li>
 </ul>
 <h3>actions</h3>
