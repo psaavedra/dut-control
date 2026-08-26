@@ -1388,3 +1388,139 @@ def test_reserve_fails_when_all_duts_in_pool_disabled(flask_client):
     data = resp.get_json()
     assert data["status"] == -2
     assert "pool does not exist" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# Multi-pool DUTs
+# ---------------------------------------------------------------------------
+
+def test_dut_pools_accepts_single_name():
+    assert server_mod._dut_pools({"metadata": {"pool": "pool-01"}}) == [
+        "pool-01"]
+    assert server_mod._dut_pools({"metadata": {"pools": "pool-01"}}) == [
+        "pool-01"]
+
+
+def test_dut_pools_accepts_list_and_dedups():
+    dut = {"metadata": {"pools": ["pool-01", "pool-02"], "pool": "pool-01"}}
+    assert server_mod._dut_pools(dut) == ["pool-01", "pool-02"]
+
+
+def test_dut_pools_empty_when_missing():
+    assert server_mod._dut_pools({"metadata": {}}) == []
+    assert server_mod._dut_pools({}) == []
+
+
+def test_load_nodes_accumulates_repeated_pool_keys(tmp_path):
+    _write_node_yaml(tmp_path / "nodes", "        - pool: pool-02")
+
+    loaded = server_mod._load_nodes(tmp_path)
+    metadata = loaded[0]["duts"][0]["metadata"]
+    assert metadata["pools"] == ["pool-01", "pool-02"]
+    assert "pool" not in metadata
+
+
+def test_load_nodes_accepts_pools_list(tmp_path):
+    nodes_dir = tmp_path / "nodes"
+    nodes_dir.mkdir()
+    (nodes_dir / "node-01.yml").write_text(
+        """
+- name: node-01
+  ssh:
+    - ip: 192.0.2.1
+  duts:
+    - name: dut-01
+      metadata:
+        - pools:
+            - pool-01
+            - pool-02
+      network:
+        - ip: 192.0.2.2
+"""
+    )
+
+    loaded = server_mod._load_nodes(tmp_path)
+    assert loaded[0]["duts"][0]["metadata"]["pools"] == ["pool-01", "pool-02"]
+
+
+def test_dut_in_several_pools_is_listed_in_each():
+    node, dut = _make_node_dut()
+    dut["metadata"] = {"pools": ["pool-01", "pool-02"]}
+
+    with server_mod.state_lock:
+        server_mod.nodes[:] = [node]
+
+    assert server_mod._pool_exists("pool-01") is True
+    assert server_mod._pool_exists("pool-02") is True
+    assert server_mod._pool_exists("pool-03") is False
+    assert server_mod._list_duts_in_pool("pool-01") == [(node, dut)]
+    assert server_mod._list_duts_in_pool("pool-02") == [(node, dut)]
+
+
+def test_reserve_from_secondary_pool(flask_client, monkeypatch):
+    client = _make_client()
+    node, dut = _make_node_dut()
+    dut["metadata"] = {"pools": ["pool-01", "pool-02"]}
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    resp = flask_client.post(
+        "/reserve",
+        json={"client-key": client["key"], "pool": "pool-02"},
+    )
+    data = resp.get_json()
+    assert data["status"] == 0
+    assert data["dut-name"] == dut["name"]
+
+
+def test_reserve_in_one_pool_blocks_the_other_pools(flask_client, monkeypatch):
+    client = _make_client()
+    node, dut = _make_node_dut()
+    dut["metadata"] = {"pools": ["pool-01", "pool-02"]}
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    resp = flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": "pool-01"})
+    assert resp.get_json()["status"] == 0
+
+    resp = flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": "pool-02"})
+    data = resp.get_json()
+    assert data["status"] == -4
+    assert "all duts in use already" in data["error"]
+
+
+def test_lease_by_secondary_pool_releases_reserve(flask_client, monkeypatch):
+    client = _make_client()
+    node, dut = _make_node_dut()
+    dut["metadata"] = {"pools": ["pool-01", "pool-02"]}
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    resp = flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": "pool-01"})
+    token = resp.get_json()["token"]
+
+    resp = flask_client.post(
+        "/lease", json={"client-key": client["key"], "pool": "pool-02"})
+    assert resp.get_json()["status"] == 0
+
+    # Expired: valid-until pulled back to the release time
+    assert server_mod._get_reserve_by_token(
+        token)["valid-until"] <= int(time.time())

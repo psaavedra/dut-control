@@ -155,6 +155,7 @@ Example:
     - name: rpi5-02
       metadata:
         - pool: rpi5
+        - pool: rpi5-fast
       network:
         - ip: 192.168.1.12
         - ssh-port: 22
@@ -169,7 +170,29 @@ Example:
 
 ```
 
-Each DUT must define at least `name`, `metadata.pool`, and `network.ip`; optional sections include storage and power scripts depending on required features.
+Each DUT must define at least `name`, at least one pool, and `network.ip`; optional sections include storage and power scripts depending on required features.
+
+A DUT can belong to several pools, so the same device can be offered both in a broad pool and in a narrower one. Any of these forms is accepted, and they can be mixed:
+
+```yaml
+      metadata:
+        - pool: rpi5            # single pool
+```
+
+```yaml
+      metadata:
+        - pool: rpi5            # repeated key, accumulated
+        - pool: rpi5-fast
+```
+
+```yaml
+      metadata:
+        - pools:                # list of names
+            - rpi5
+            - rpi5-fast
+```
+
+Unlike the rest of the configuration sections, where a repeated key keeps the last value, pool entries are accumulated. Once loaded, the DUT metadata always exposes the resolved list as `pools` (visible in `/conf/info/nodes`). A DUT is reservable through any of its pools, and reserving it through one pool makes it unavailable in all the others.
 
 ## Running the service
 
@@ -202,7 +225,7 @@ Reserve a DUT from a given pool.
 - **Path**: `/reserve`
 - **Request body**:
   - `client-key` (string, required): client key from configuration
-  - `pool` (string, required): pool name (from DUT `metadata.pool`)
+  - `pool` (string, required): pool name (from DUT `metadata.pools`)
 
 On success, the service:
 

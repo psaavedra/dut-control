@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_reserve.add_argument(
         "pool",
-        help="Pool name (metadata.pool in DUT config)",
+        help="Pool name (metadata.pools in DUT config)",
     )
     sp_reserve.set_defaults(func=cmd_reserve)
 
