@@ -144,6 +144,53 @@ def _normalize_section(value):
     return {}
 
 
+def _is_pool_name(value) -> bool:
+    """
+    True for a value usable as a pool name.
+
+    Booleans are rejected even though bool subclasses int: YAML reads a bare
+    "pool: yes" as True, and naming a pool "True" is never what that meant.
+    """
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (str, int)) and str(value) != ""
+
+
+def _as_pool_list(value):
+    """Coerce a pool declaration (a name or a list of names) into a list."""
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if _is_pool_name(v)]
+    return [str(value)] if _is_pool_name(value) else []
+
+
+def _collect_pool_names(value):
+    """Gather every pool name declared in a raw metadata section."""
+    items = value if isinstance(value, list) else [value]
+    names = []
+    for item in items:
+        if isinstance(item, dict):
+            names += _as_pool_list(item.get("pools"))
+            names += _as_pool_list(item.get("pool"))
+    return list(dict.fromkeys(names))
+
+
+def _normalize_metadata(value):
+    """
+    Normalize a DUT metadata section into a flat dict.
+
+    Pool declarations are the one exception to the "last key wins" rule of
+    _normalize_section(): every ``pool``/``pools`` entry is accumulated into a
+    single ``pools`` list, so a DUT can belong to more than one pool either by
+    repeating ``pool`` or by giving a list of names.
+    """
+    # Copy: _normalize_section() hands back the caller's own mapping for
+    # dict-style input, which _collect_pool_names() still has to read.
+    metadata = dict(_normalize_section(value))
+    metadata["pools"] = _collect_pool_names(value)
+    metadata.pop("pool", None)
+    return metadata
+
+
 def _load_yaml_file(path: Path):
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -192,7 +239,7 @@ def _load_nodes(config_dir: Path):
             for dut in doc.get("duts", []):
                 if not isinstance(dut, dict):
                     continue
-                metadata = _normalize_section(dut.get("metadata", {}))
+                metadata = _normalize_metadata(dut.get("metadata", {}))
                 metadata.setdefault("enabled", True)
                 d = {
                     "name": dut["name"],
@@ -267,12 +314,32 @@ def _dut_enabled(dut: dict) -> bool:
     return bool(dut.get("metadata", {}).get("enabled", True))
 
 
+def _dut_pools(dut: dict) -> list[str]:
+    """Return the list of pools a DUT belongs to.
+
+    Both ``metadata.pools`` and the legacy ``metadata.pool`` are honoured, and
+    either may hold a single name or a list of names.
+    """
+    metadata = dut.get("metadata", {})
+    names = _as_pool_list(metadata.get("pools"))
+    names += _as_pool_list(metadata.get("pool"))
+    return list(dict.fromkeys(names))
+
+
+def _dut_in_pool(dut: dict, pool: str) -> bool:
+    return pool in _dut_pools(dut)
+
+
 def _pool_exists(pool: str) -> bool:
+    """Whether any enabled DUT belongs to the pool.
+
+    Kept separate from _list_duts_in_pool() so an existence check returns on
+    the first match instead of building the whole listing.
+    """
     with state_lock:
         for node in nodes:
             for dut in node.get("duts", []):
-                if (dut.get("metadata", {}).get("pool") == pool
-                        and _dut_enabled(dut)):
+                if _dut_in_pool(dut, pool) and _dut_enabled(dut):
                     return True
     return False
 
@@ -284,8 +351,7 @@ def _list_duts_in_pool(pool: str):
     with state_lock:
         for node in nodes:
             for dut in node.get("duts", []):
-                if (dut.get("metadata", {}).get("pool") == pool
-                        and _dut_enabled(dut)):
+                if _dut_in_pool(dut, pool) and _dut_enabled(dut):
                     result.append((node, dut))
     return result
 
@@ -692,7 +758,7 @@ def _get_tokens_to_release(body: dict, now: float) -> set[str]:
     pool = body.get("pool")
 
     if pool:
-        if not _pool_exists(pool) or not _list_duts_in_pool(pool):
+        if not _pool_exists(pool):
             raise ValueError("pool does not exist or is empty")
 
     with state_lock:
@@ -719,7 +785,7 @@ def _matches_mode(reserve: dict, body: dict) -> bool:
         return reserve.get("token") == token
     if pool:
         node, dut = _get_dut_and_node_by_name(reserve["dut-name"])
-        return dut and dut.get("metadata", {}).get("pool") == pool
+        return bool(dut) and _dut_in_pool(dut, pool)
     return True  # All mode
 
 
