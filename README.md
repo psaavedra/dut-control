@@ -18,6 +18,7 @@ Core pieces:
 
 - DUT reservation by pool with time-limited tokens
 - Automatic reverse SSH tunnel setup from the service to the client to expose the DUT SSH port on a client port
+- Client SSH address/port overrides announced per request, for clients behind NAT or with a dynamic address
 - Lease/cleanup of reservations, including process and port management
 - Power control (on/off/cycle) via per-DUT scripts executed over SSH on the node
 - Image flashing pipeline using `scp`, `usbsdmux`, and `bmaptool` on the node
@@ -124,6 +125,8 @@ Example:
 
 `ssh` and `ports-range` sections are normalized by the service into dictionaries.
 
+`ssh.ip` and `ssh.port` are the address the service uses to reach the client back (reverse tunnel and image `scp`). A client that is not reachable at that address, typically because it sits behind NAT and only knows its public address and forwarded port at run time, can announce the right values on each request; see [Client SSH overrides](#client-ssh-overrides). Such a client still needs an `ssh` section in its YAML entry, if only for `user`; the announced values replace the configured ones in memory.
+
 ### Node and DUT configuration
 
 Nodes and their DUTs are defined under `nodes/*.yml`.
@@ -217,6 +220,35 @@ For production use you will typically want to run the Flask server behind a WSGI
 
 All API endpoints use JSON bodies and responses.
 
+### Client SSH overrides
+
+Any endpoint that takes a `client-key` (`/pools`, `/reserve`, `/lease`), plus `/flash`, accepts two optional fields overriding the SSH parameters the service uses to connect back to the client:
+
+- `client-ssh-ip` (string): address to use instead of the configured `ssh.ip`. An IPv4 or IPv6 literal, or a DNS name (dynamic DNS is the usual way a NATed client is addressed)
+- `client-ssh-port` (integer, or its decimal string form): port to use instead of the configured `ssh.port`, in the range 1-65535
+
+This is what makes a client behind NAT usable: the client announces the address and forwarded port at which the service can actually reach it, which its static YAML entry cannot know.
+
+The service applies the announced values to the in-memory client and records which fields no longer come from the configuration in the client attribute `ssh-overrides`, a sorted list holding `"ip"`, `"port"`, or both. The attribute is visible in `/conf/info/clients` and therefore identifies the dynamically addressed clients:
+
+```json
+{
+  "name": "client-01",
+  "key": "fac72a9494cd132a",
+  "ssh": { "ip": "203.0.113.9", "port": 2222, "user": "psaavedra" },
+  "ports-range": { "from": 5000, "to": 5010 },
+  "ssh-overrides": ["ip", "port"]
+}
+```
+
+Notes:
+
+- The override persists in memory until the client announces a different value, so a reservation made with an override keeps working for later `/power`, `/flash`, and `/dut/status` calls that carry no override of their own
+- A request announcing only one of the two fields leaves the other override in place, and `ssh-overrides` accumulates accordingly
+- `ssh.user` is never overridable; it always comes from the configuration
+- Overrides are in-memory only: `/conf/reload` or a service restart rebuilds the client list from the YAML and drops both the values and the `ssh-overrides` marker
+- Both fields are validated before use and a field that is present but unusable fails the request with `status = -5` instead of silently falling back to the configured value, so a typo does not send the service connecting to the wrong host. The address ends up in an `ssh user@host` argument, so a value that is neither a well-formed address literal nor a DNS name is rejected: that covers empty or non-string values, malformed literals such as `203.0.113.999`, and anything carrying whitespace, shell metacharacters, a `user@` prefix or a `:port` suffix. The port is rejected unless it is a decimal number in the 1-65535 range (booleans included, which JSON allows where an integer is expected)
+
 ### Pool listing: /pools
 
 List the pools a client can reserve from, with their DUT counts.
@@ -240,7 +272,7 @@ List the pools a client can reserve from, with their DUT counts.
 
 `enabled-duts` counts the DUTs in the pool that are enabled; `free-duts` counts those of them without an unexpired reservation, so it is what `/reserve` could currently hand out. Pools are sorted by name, and a pool whose DUTs are all disabled is omitted, since it cannot be reserved from at all.
 
-Missing or invalid `client-key` returns `status = -1`.
+Missing or invalid `client-key` returns `status = -1`; an invalid SSH override returns `status = -5` (see [Client SSH overrides](#client-ssh-overrides)).
 
 ### Reservation: /reserve
 
@@ -251,6 +283,7 @@ Reserve a DUT from a given pool.
 - **Request body**:
   - `client-key` (string, required): client key from configuration
   - `pool` (string, required): pool name (from DUT `metadata.pools`)
+  - `client-ssh-ip` (string, optional) and `client-ssh-port` (integer, optional): address the service must use to reach the client back, see [Client SSH overrides](#client-ssh-overrides)
 
 On success, the service:
 
@@ -268,9 +301,12 @@ On success, the service:
   "dut-name": "rpi5-01",
   "ip": "192.168.1.105",
   "ssh-port": 22,
-  "tunnel-ssh-port": 5000
+  "tunnel-ssh-port": 5000,
+  "client-ssh-overrides": ["ip", "port"]
 }
 ```
+
+`client-ssh-overrides` echoes back the SSH fields of the client that are currently overridden, and is an empty list for a client using its configured address.
 
 **Error responses** use HTTP 200 with a JSON body containing `status` and `error`:
 
@@ -278,6 +314,7 @@ On success, the service:
 - `status = -2`: missing `pool` or pool does not exist
 - `status = -3`: pool exists but is empty
 - `status = -4`: all DUTs in pool already reserved or no free ports for client
+- `status = -5`: invalid `client-ssh-ip` or `client-ssh-port`
 - `status = -99`: internal error when starting the SSH tunnel
 
 ### Lease / release: /lease
@@ -288,6 +325,7 @@ Release reservations associated with a client.
 - **Path**: `/lease`
 - **Request body**:
   - `client-key` (string, required)
+  - `client-ssh-ip` / `client-ssh-port` (optional): see [Client SSH overrides](#client-ssh-overrides)
   - One of:
     - `token` (string): release only this reservation
     - `pool` (string): release reservations in the given pool for the client
@@ -343,6 +381,7 @@ Flash an image onto DUT storage via the node.
 - **Request body**:
   - `token` (string, required): reservation token
   - `path` (string, required): path to the image file as seen from the client host
+  - `client-ssh-ip` (string, optional) and `client-ssh-port` (integer, optional): address the service must use to `scp` the image off the client, see [Client SSH overrides](#client-ssh-overrides). Accepted here as well as on `/reserve` because a client with a dynamic address may have moved since it reserved
 
 The service performs the following steps:
 
@@ -374,6 +413,7 @@ Step 3-5 (the node-side flash/verify/switch-back) is serialized per node: if two
 **Responses**:
 
 - Missing `path`: `{"status": -99, "error": "path missing"}`
+- Invalid SSH override: `{"status": -5, "error": "client-ssh-ip is not valid"|"client-ssh-port is not valid"}`
 - Missing client or DUT in configuration: `{"status": -99, "error": "client not found"|"dut not found"}`
 - Flash pipeline failure: `{"status": -99, "error": "..."}` (e.g. `"scp from client failed"`, `"flash command failed on node"`)
 - Verification mismatch: `{"status": -99, "error": "flash verification failed: ..."}`
@@ -438,6 +478,10 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 - `DUT_CONTROL_URL` (optional): base URL of the service (default `http://localhost:8000`)
 - `DUT_CONTROL_CLIENT_KEY` (required for `reserve` and `lease`): client key matching configuration
+- `DUT_CONTROL_CLIENT_SSH_IP` (optional): address the service must use to reach this host back, overriding the `ssh.ip` of its configuration entry
+- `DUT_CONTROL_CLIENT_SSH_PORT` (optional): port to use instead of the configured `ssh.port`
+
+`DUT_CONTROL_CLIENT_SSH_IP` and `DUT_CONTROL_CLIENT_SSH_PORT` are sent by the `reserve` and `flash` subcommands, the two that make the service connect back to this host, and are simply omitted when unset. Both are validated by the CLI before any request is made (same rules as the service, see [Client SSH overrides](#client-ssh-overrides)); an invalid value aborts the command with `error: <VARIABLE> is not a valid value: ...` on stderr and exit status 1, so the variable at fault is named where it was set.
 
 **Global options**:
 
@@ -456,7 +500,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   ```
 
 - **`reserve <pool>`**
-  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout
+  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
   Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used
@@ -477,6 +521,11 @@ export DUT_CONTROL_URL=http://lab-controller:8000
 export DUT_CONTROL_CLIENT_KEY=fac72a9494cd132a
 
 # Reserve a DUT from pool "rpi5"
+dut-control-client reserve rpi5
+
+# Same, from a host behind NAT reachable at 203.0.113.9:2222
+export DUT_CONTROL_CLIENT_SSH_IP=203.0.113.9
+export DUT_CONTROL_CLIENT_SSH_PORT=2222
 dut-control-client reserve rpi5
 
 # Release all reservations for this client

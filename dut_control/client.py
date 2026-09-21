@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import ipaddress
 import os
+import re
 import sys
 from typing import Any, Dict
 
@@ -9,10 +11,88 @@ import requests
 
 DEFAULT_BASE_URL = os.environ.get("DUT_CONTROL_URL", "http://localhost:8000")
 CLIENT_KEY_ENV = "DUT_CONTROL_CLIENT_KEY"
+CLIENT_SSH_IP_ENV = "DUT_CONTROL_CLIENT_SSH_IP"
+CLIENT_SSH_PORT_ENV = "DUT_CONTROL_CLIENT_SSH_PORT"
+
+# A single DNS label, as on the service side
+_HOSTNAME_LABEL = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 def _full_url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
+
+
+def _env_error_and_exit(env_name: str, value: str) -> None:
+    print(
+        f"error: {env_name} is not a valid value: {value!r}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _is_hostname(value: str) -> bool:
+    """True for a plausible DNS name; mirrors the service-side check."""
+    host = value.rstrip(".")
+    if not host or len(host) > 253:
+        return False
+    labels = host.split(".")
+    # An all-numeric rightmost label is a malformed address literal, not
+    # a name: 192.168.1.999 is a typo, not a host to resolve.
+    if labels[-1].isdigit():
+        return False
+    return all(_HOSTNAME_LABEL.match(label) for label in labels)
+
+
+def _checked_ssh_ip(value: str) -> str:
+    """
+    An announced address: an IPv4/IPv6 literal or a DNS name. Checked
+    here as well as on the service so a typo in the environment names
+    the variable at fault instead of coming back as a rejected request.
+    """
+    host = value.strip()
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+
+    if not _is_hostname(host):
+        _env_error_and_exit(CLIENT_SSH_IP_ENV, value)
+    return host
+
+
+def _checked_ssh_port(value: str) -> int:
+    """An announced port: a decimal TCP port number."""
+    try:
+        port = int(value.strip(), 10)
+    except ValueError:
+        port = -1
+    if not 1 <= port <= 65535:
+        _env_error_and_exit(CLIENT_SSH_PORT_ENV, value)
+    return port
+
+
+def _ssh_override_payload() -> Dict[str, Any]:
+    """
+    Address the service has to use to reach this host back, when the one
+    in its configuration is not the right one; typically because this
+    host sits behind NAT and only knows its public address (and the
+    forwarded port) at run time.
+
+    Empty when neither environment variable is set, in which case the
+    service keeps using the configured SSH parameters.
+    """
+    payload: Dict[str, Any] = {}
+
+    ip = os.environ.get(CLIENT_SSH_IP_ENV)
+    if ip:
+        payload["client-ssh-ip"] = _checked_ssh_ip(ip)
+
+    port = os.environ.get(CLIENT_SSH_PORT_ENV)
+    if port:
+        payload["client-ssh-port"] = _checked_ssh_port(port)
+
+    return payload
 
 
 def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
@@ -64,6 +144,7 @@ def cmd_reserve(args: argparse.Namespace) -> None:
 
     base_url = args.url
     payload = {"client-key": client_key, "pool": args.pool}
+    payload.update(_ssh_override_payload())
 
     resp = requests.post(
         _full_url(base_url, "/reserve"),
@@ -81,6 +162,10 @@ def cmd_reserve(args: argparse.Namespace) -> None:
     print(f"ip: {data['ip']}")
     print(f"ssh-port: {data['ssh-port']}")
     print(f"tunnel-ssh-port: {data['tunnel-ssh-port']}")
+
+    overrides = data.get("client-ssh-overrides") or []
+    if overrides:
+        print(f"client-ssh-overrides: {', '.join(overrides)}")
 
 
 def cmd_lease(args: argparse.Namespace) -> None:
@@ -138,6 +223,9 @@ def cmd_power(args: argparse.Namespace) -> None:
 def cmd_flash(args: argparse.Namespace) -> None:
     base_url = args.url
     payload = {"token": args.token, "path": args.path}
+    # The service scp's the image off this host, so it needs the same
+    # override, which may well have changed since the reservation.
+    payload.update(_ssh_override_payload())
 
     resp = requests.post(
         _full_url(base_url, "/flash"),

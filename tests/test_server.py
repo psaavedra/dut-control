@@ -1706,3 +1706,352 @@ def test_lease_by_secondary_pool_releases_reserve(flask_client, monkeypatch):
     # Expired: valid-until pulled back to the release time
     assert server_mod._get_reserve_by_token(
         token)["valid-until"] <= int(time.time())
+
+
+# ---------------------------------------------------------------------------
+# Client SSH overrides
+# ---------------------------------------------------------------------------
+
+def test_parse_client_ssh_overrides_valid_values():
+    assert server_mod._parse_client_ssh_overrides({}) == {}
+    assert server_mod._parse_client_ssh_overrides(
+        {"client-ssh-ip": " 203.0.113.9 "}) == {"ip": "203.0.113.9"}
+    # A port arriving as a string (the CLI forwards the raw env var)
+    assert server_mod._parse_client_ssh_overrides(
+        {"client-ssh-port": "2222"}) == {"port": 2222}
+    assert server_mod._parse_client_ssh_overrides(
+        {"client-ssh-ip": "203.0.113.9", "client-ssh-port": 2222}
+    ) == {"ip": "203.0.113.9", "port": 2222}
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("203.0.113.9", "203.0.113.9"),
+    ("  203.0.113.9  ", "203.0.113.9"),
+    ("2001:db8::1", "2001:db8::1"),
+    # Dynamic DNS is the usual way a NATed client is addressed
+    ("client-01.dyn.example.com", "client-01.dyn.example.com"),
+    ("client-01.dyn.example.com.", "client-01.dyn.example.com."),
+    ("localhost", "localhost"),
+])
+def test_valid_ssh_host_accepts_addresses_and_names(value, expected):
+    assert server_mod._valid_ssh_host(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "",
+    "   ",
+    1234,
+    None,
+    True,
+    ["203.0.113.9"],
+    # Malformed literals must not pass as DNS names
+    "203.0.113.999",
+    "203.0.113",
+    "010.0.113.9",
+    # Anything that would not survive as an `ssh user@host` argument
+    "203.0.113.9 -oProxyCommand=id",
+    "root@203.0.113.9",
+    "203.0.113.9:2222",
+    "$(id).example.com",
+    "-oProxyCommand=id",
+    "client..example.com",
+    "client-.example.com",
+    "a" * 64 + ".example.com",
+])
+def test_valid_ssh_host_rejects_bad_values(value):
+    with pytest.raises(ValueError):
+        server_mod._valid_ssh_host(value)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (22, 22),
+    ("2222", 2222),
+    (" 2222 ", 2222),
+    (65535, 65535),
+])
+def test_valid_ssh_port_accepts_port_numbers(value, expected):
+    assert server_mod._valid_ssh_port(value) == expected
+
+
+@pytest.mark.parametrize("body", [
+    {"client-ssh-ip": ""},
+    {"client-ssh-ip": "   "},
+    {"client-ssh-ip": 1234},
+    {"client-ssh-port": "not-a-port"},
+    {"client-ssh-port": 0},
+    {"client-ssh-port": -1},
+    {"client-ssh-port": 65536},
+    {"client-ssh-port": True},
+    {"client-ssh-port": []},
+])
+def test_parse_client_ssh_overrides_rejects_bad_values(body):
+    with pytest.raises(ValueError):
+        server_mod._parse_client_ssh_overrides(body)
+
+
+def test_reserve_rejects_injection_in_client_ssh_ip(flask_client, monkeypatch):
+    """A bogus address never reaches the ssh command line."""
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError("no tunnel must be started")
+
+    monkeypatch.setattr(server_mod.subprocess, "Popen", fail_popen)
+
+    resp = flask_client.post(
+        "/reserve",
+        json={
+            "client-key": client["key"],
+            "pool": "pool-01",
+            "client-ssh-ip": "203.0.113.9 -oProxyCommand=id",
+        },
+    )
+    data = resp.get_json()
+    assert data["status"] == -5
+    assert "client-ssh-ip" in data["error"]
+
+    with server_mod.state_lock:
+        assert client["ssh"]["ip"] == "192.0.2.10"
+        assert server_mod.reserves == []
+
+
+def test_reserve_applies_client_ssh_overrides(flask_client, monkeypatch):
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    resp = flask_client.post(
+        "/reserve",
+        json={
+            "client-key": client["key"],
+            "pool": "pool-01",
+            "client-ssh-ip": "203.0.113.9",
+            "client-ssh-port": 2222,
+        },
+    )
+    data = resp.get_json()
+    assert data["status"] == 0
+    assert data["client-ssh-overrides"] == ["ip", "port"]
+
+    with server_mod.state_lock:
+        assert client["ssh"]["ip"] == "203.0.113.9"
+        assert client["ssh"]["port"] == 2222
+        # The user is not overridable and keeps coming from the config
+        assert client["ssh"]["user"] == "tester"
+        assert client["ssh-overrides"] == ["ip", "port"]
+
+
+def test_reserve_without_overrides_keeps_configured_ssh(
+        flask_client, monkeypatch):
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    resp = flask_client.post(
+        "/reserve",
+        json={"client-key": client["key"], "pool": "pool-01"},
+    )
+    data = resp.get_json()
+    assert data["status"] == 0
+    assert data["client-ssh-overrides"] == []
+
+    with server_mod.state_lock:
+        assert client["ssh"] == {"ip": "192.0.2.10", "port": 22,
+                                 "user": "tester"}
+        assert "ssh-overrides" not in client
+
+
+def test_reserve_tunnel_uses_overridden_address(flask_client, monkeypatch):
+    """The reverse tunnel must be opened to the announced address."""
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01", dut_ip="192.0.2.30")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(server_mod.subprocess, "Popen", fake_popen)
+
+    resp = flask_client.post(
+        "/reserve",
+        json={
+            "client-key": client["key"],
+            "pool": "pool-01",
+            "client-ssh-ip": "203.0.113.9",
+            "client-ssh-port": "2222",
+        },
+    )
+    data = resp.get_json()
+    assert data["status"] == 0
+
+    cmd = captured["cmd"]
+    assert "tester@203.0.113.9" in cmd
+    assert cmd[cmd.index("-p") + 1] == "2222"
+
+
+def test_reserve_rejects_invalid_client_ssh_port(flask_client, monkeypatch):
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    resp = flask_client.post(
+        "/reserve",
+        json={
+            "client-key": client["key"],
+            "pool": "pool-01",
+            "client-ssh-port": "ssh",
+        },
+    )
+    data = resp.get_json()
+    assert data["status"] == -5
+    assert "client-ssh-port" in data["error"]
+
+    # Nothing reserved and the configured address left untouched
+    with server_mod.state_lock:
+        assert server_mod.reserves == []
+        assert client["ssh"]["port"] == 22
+
+
+def test_client_ssh_override_marker_accumulates(flask_client, monkeypatch):
+    """Announcing one field at a time leaves the other override in place."""
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    monkeypatch.setattr(
+        server_mod, "_start_ssh_tunnel", lambda *a, **k: {"pid": 1})
+
+    flask_client.post(
+        "/reserve",
+        json={
+            "client-key": client["key"],
+            "pool": "pool-01",
+            "client-ssh-ip": "203.0.113.9",
+        },
+    )
+    with server_mod.state_lock:
+        assert client["ssh-overrides"] == ["ip"]
+
+    # A later call announcing only the port keeps the ip override
+    flask_client.post(
+        "/pools",
+        json={"client-key": client["key"], "client-ssh-port": 2222},
+    )
+    with server_mod.state_lock:
+        assert client["ssh"] == {"ip": "203.0.113.9", "port": 2222,
+                                 "user": "tester"}
+        assert client["ssh-overrides"] == ["ip", "port"]
+
+
+def _reserve_for_flash(client, dut, token):
+    with server_mod.state_lock:
+        now = int(time.time())
+        server_mod.reserves.append(
+            {
+                "token": token,
+                "valid-from": now - 10,
+                "valid-until": now + 3600,
+                "client-key": client["key"],
+                "dut-name": dut["name"],
+            }
+        )
+
+
+def test_flash_applies_client_ssh_overrides(flask_client, monkeypatch):
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01")
+    token = "token-flash-override"
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+    _reserve_for_flash(client, dut, token)
+
+    seen = {}
+
+    def fake_flash_image(node_arg, dut_arg, client_arg, client_path):
+        seen["ssh"] = dict(client_arg["ssh"])
+
+    monkeypatch.setattr(server_mod, "_flash_image", fake_flash_image)
+
+    resp = flask_client.post(
+        "/flash",
+        json={
+            "token": token,
+            "path": "/images/image.wic",
+            "client-ssh-ip": "203.0.113.9",
+            "client-ssh-port": 2222,
+        },
+    )
+    assert resp.get_json()["status"] == 0
+    assert seen["ssh"]["ip"] == "203.0.113.9"
+    assert seen["ssh"]["port"] == 2222
+
+    with server_mod.state_lock:
+        assert client["ssh-overrides"] == ["ip", "port"]
+
+
+def test_flash_rejects_invalid_client_ssh_ip(flask_client, monkeypatch):
+    client = _make_client(ip="192.0.2.10", port=22)
+    node, dut = _make_node_dut(pool="pool-01")
+    token = "token-flash-bad-override"
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+    _reserve_for_flash(client, dut, token)
+
+    def fail_flash_image(*args, **kwargs):
+        raise AssertionError("flash must not run with a bad override")
+
+    monkeypatch.setattr(server_mod, "_flash_image", fail_flash_image)
+
+    resp = flask_client.post(
+        "/flash",
+        json={
+            "token": token,
+            "path": "/images/image.wic",
+            "client-ssh-ip": "",
+        },
+    )
+    data = resp.get_json()
+    assert data["status"] == -5
+    assert "client-ssh-ip" in data["error"]
+
+    with server_mod.state_lock:
+        assert client["ssh"]["ip"] == "192.0.2.10"
