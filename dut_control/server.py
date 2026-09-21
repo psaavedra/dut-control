@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import ipaddress
 import os
 import random
+import re
 import secrets
 import shlex
 import shutil
@@ -63,6 +65,11 @@ def validate_client(func):
         if client is None:
             return jsonify(
                 {"status": -1, "error": "client key is not valid"}), 200
+
+        try:
+            _apply_client_ssh_overrides(client, body)
+        except ValueError as e:
+            return jsonify({"status": -5, "error": str(e)}), 200
 
         request.client = client
         result = func(*args, **kwargs)
@@ -439,6 +446,121 @@ def _find_free_port_for_client(client: dict) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Client SSH overrides
+# ---------------------------------------------------------------------------
+
+# A single DNS label: letters/digits/hyphens, not starting or ending with a
+# hyphen, 63 characters at most.
+_HOSTNAME_LABEL = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _is_hostname(value: str) -> bool:
+    """
+    True for a plausible DNS name. Names are accepted alongside literal
+    addresses because a client with a dynamic address often announces
+    itself through dynamic DNS instead of a bare IP.
+    """
+    host = value.rstrip(".")
+    if not host or len(host) > 253:
+        return False
+    labels = host.split(".")
+    # An all-numeric rightmost label means a malformed address literal
+    # rather than a name: 192.168.1.999 is a typo, not a host to resolve.
+    if labels[-1].isdigit():
+        return False
+    return all(_HOSTNAME_LABEL.match(label) for label in labels)
+
+
+def _valid_ssh_host(value) -> str:
+    """
+    Validate an announced SSH address: an IPv4/IPv6 literal or a DNS
+    name. The value ends up in an `ssh user@host` argument, so anything
+    else (whitespace, shell metacharacters, a user@ or :port suffix, an
+    empty string) is rejected here rather than handed to ssh.
+    """
+    if not isinstance(value, str):
+        raise ValueError("client-ssh-ip is not valid")
+
+    host = value.strip()
+    try:
+        # Normalizes the literal as a side effect (and rejects oddities
+        # such as leading zeros in an IPv4 octet).
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+
+    if not _is_hostname(host):
+        raise ValueError("client-ssh-ip is not valid")
+    return host
+
+
+def _valid_ssh_port(value) -> int:
+    """
+    Coerce an announced SSH port, rejecting anything unusable.
+
+    Booleans are rejected before the int() conversion even though bool
+    subclasses int: a "client-ssh-port": true is never a port.
+    """
+    if isinstance(value, bool):
+        raise ValueError("client-ssh-port is not valid")
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("client-ssh-port is not valid")
+    if not 1 <= port <= 65535:
+        raise ValueError("client-ssh-port is not valid")
+    return port
+
+
+def _parse_client_ssh_overrides(body: dict) -> dict:
+    """
+    The SSH ip/port a client announces for itself in a request body.
+
+    A client behind NAT is not reachable at the address written in its
+    YAML entry, so it can tell the service which address and port to use
+    when connecting back to it. A value that is present but unusable
+    raises instead of being dropped, so a typo fails the request rather
+    than silently falling back to the configured one.
+    """
+    overrides = {}
+
+    ip = body.get("client-ssh-ip")
+    if ip is not None:
+        overrides["ip"] = _valid_ssh_host(ip)
+
+    port = body.get("client-ssh-port")
+    if port is not None:
+        overrides["port"] = _valid_ssh_port(port)
+
+    return overrides
+
+
+def _apply_client_ssh_overrides(client: dict, body: dict) -> list[str]:
+    """
+    Apply the overrides announced in `body` to the in-memory client and
+    return the names of its SSH fields that no longer come from the
+    configuration.
+
+    The same names are recorded on the client as `ssh-overrides` (a
+    sorted list holding "ip", "port", or both), which marks the client as
+    dynamically addressed for anyone reading /conf/info/clients. The
+    marker accumulates, since a request announcing only one of the two
+    fields leaves the other override in place.
+
+    The change lives in memory only: /conf/reload rebuilds the client
+    list from the YAML and drops both the values and the marker.
+    """
+    overrides = _parse_client_ssh_overrides(body)
+    with state_lock:
+        if overrides:
+            client.setdefault("ssh", {}).update(overrides)
+            overridden = set(client.get("ssh-overrides", []))
+            client["ssh-overrides"] = sorted(overridden | set(overrides))
+        return list(client.get("ssh-overrides", []))
+
+
+# ---------------------------------------------------------------------------
 # Process management (SSH tunnels)
 # ---------------------------------------------------------------------------
 
@@ -735,7 +857,8 @@ def reserve():
         "dut-name": dut["name"],
         "ip": dut["network"]["ip"],
         "ssh-port": dut["network"]["ssh-port"],
-        "tunnel-ssh-port": free_port
+        "tunnel-ssh-port": free_port,
+        "client-ssh-overrides": request.client.get("ssh-overrides", []),
     }), 200
 
 
@@ -1219,6 +1342,13 @@ def flash():
     node, dut = _get_dut_and_node_by_name(reserve_entry["dut-name"])
     if not node or not dut:
         return jsonify({"status": -99, "error": "dut not found"}), 200
+
+    # /flash reaches the client by SSH on its own, and a NATed client may
+    # have moved since it reserved, so it can re-announce its address here.
+    try:
+        _apply_client_ssh_overrides(client, body)
+    except ValueError as e:
+        return jsonify({"status": -5, "error": str(e)}), 200
 
     try:
         _flash_image(node, dut, client, path)
