@@ -16,9 +16,10 @@ import dut_control.client as client_mod  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def clear_override_env(monkeypatch):
-    """The CLI reads the overrides from the environment; start clean."""
+    """The CLI reads these from the environment; start clean."""
     monkeypatch.delenv(client_mod.CLIENT_SSH_IP_ENV, raising=False)
     monkeypatch.delenv(client_mod.CLIENT_SSH_PORT_ENV, raising=False)
+    monkeypatch.delenv(client_mod.TOKEN_ENV, raising=False)
 
 
 def test_ssh_override_payload_empty_without_env():
@@ -141,3 +142,70 @@ def test_reserve_forwards_whatever_the_service_added(answers, capsys):
     client_mod.main(["reserve", "rpi5", "--json"])
 
     assert json.loads(capsys.readouterr().out)["lease-expires"]
+
+
+OK = {"status": 0}
+
+
+@pytest.mark.parametrize("command", [
+    ["power", "on"],
+    ["status"],
+    ["flash", "/images/rpi5.wic"],
+])
+def test_a_subcommand_takes_the_token_from_the_environment(answers,
+                                                           monkeypatch,
+                                                           command):
+    calls = answers(OK)
+    monkeypatch.setenv(client_mod.TOKEN_ENV, "from-the-environment")
+
+    assert client_mod.main(command) == 0
+
+    assert calls[0][1]["token"] == "from-the-environment"
+
+
+def test_a_token_on_the_command_line_still_wins(answers, monkeypatch):
+    calls = answers(OK)
+    monkeypatch.setenv(client_mod.TOKEN_ENV, "from-the-environment")
+
+    client_mod.main(["power", "on", "given-here"])
+
+    assert calls[0][1]["token"] == "given-here"
+
+
+def test_a_subcommand_with_no_token_anywhere_names_the_variable(answers,
+                                                                capsys):
+    answers(OK)
+
+    with pytest.raises(SystemExit) as exit_info:
+        client_mod.main(["status"])
+
+    assert exit_info.value.code == 1
+    assert client_mod.TOKEN_ENV in capsys.readouterr().err
+
+
+def test_lease_releases_the_reservation_the_environment_names(answers,
+                                                              monkeypatch):
+    calls = answers(OK)
+    monkeypatch.setenv(client_mod.TOKEN_ENV, "from-the-environment")
+
+    client_mod.main(["lease"])
+
+    assert calls[0][1]["token"] == "from-the-environment"
+
+
+def test_lease_all_still_means_all(answers, monkeypatch):
+    """The environment must not narrow what was asked for explicitly."""
+    calls = answers(OK)
+    monkeypatch.setenv(client_mod.TOKEN_ENV, "from-the-environment")
+
+    client_mod.main(["lease", "--all"])
+
+    assert "token" not in calls[0][1]
+
+
+def test_lease_with_nothing_set_still_releases_everything(answers):
+    calls = answers(OK)
+
+    client_mod.main(["lease"])
+
+    assert "token" not in calls[0][1]

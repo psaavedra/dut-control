@@ -12,6 +12,7 @@ import requests
 
 DEFAULT_BASE_URL = os.environ.get("DUT_CONTROL_URL", "http://localhost:8000")
 CLIENT_KEY_ENV = "DUT_CONTROL_CLIENT_KEY"
+TOKEN_ENV = "DUT_CONTROL_TOKEN"
 CLIENT_SSH_IP_ENV = "DUT_CONTROL_CLIENT_SSH_IP"
 CLIENT_SSH_PORT_ENV = "DUT_CONTROL_CLIENT_SSH_PORT"
 
@@ -94,6 +95,23 @@ def _ssh_override_payload() -> Dict[str, Any]:
         payload["client-ssh-port"] = _checked_ssh_port(port)
 
     return payload
+
+
+def _required_token(args: argparse.Namespace) -> str:
+    """
+    The reservation token, from the argument or the environment.
+
+    A token on the command line is readable in `ps` by every other user
+    of the host, and ends up in any log that echoes the command.
+    """
+    token = args.token or os.environ.get(TOKEN_ENV)
+    if not token:
+        print(
+            f"error: no token given and {TOKEN_ENV} is not set",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return token
 
 
 def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
@@ -186,8 +204,14 @@ def cmd_lease(args: argparse.Namespace) -> None:
     base_url = args.url
     payload: Dict[str, Any] = {"client-key": client_key}
 
-    if args.token:
-        payload["token"] = args.token
+    token = args.token
+    if not token and not args.pool and not args.all:
+        # Nothing asked for: release just this reservation if the
+        # environment names one, rather than everything this client holds.
+        token = os.environ.get(TOKEN_ENV)
+
+    if token:
+        payload["token"] = token
     if args.pool:
         payload["pool"] = args.pool
 
@@ -209,7 +233,7 @@ def cmd_lease(args: argparse.Namespace) -> None:
 
 def cmd_power(args: argparse.Namespace) -> None:
     base_url = args.url
-    payload = {"token": args.token}
+    payload = {"token": _required_token(args)}
 
     resp = requests.post(
         _full_url(base_url, f"/power/{args.action}"),
@@ -228,7 +252,7 @@ def cmd_power(args: argparse.Namespace) -> None:
 
 def cmd_flash(args: argparse.Namespace) -> None:
     base_url = args.url
-    payload = {"token": args.token, "path": args.path}
+    payload = {"token": _required_token(args), "path": args.path}
     # The service scp's the image off this host, so it needs the same
     # override, which may well have changed since the reservation.
     payload.update(_ssh_override_payload())
@@ -250,7 +274,7 @@ def cmd_flash(args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     base_url = args.url
-    payload = {"token": args.token}
+    payload = {"token": _required_token(args)}
 
     resp = requests.post(
         _full_url(base_url, "/dut/status"),
@@ -354,7 +378,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_power.add_argument(
         "token",
-        help="Reservation token",
+        nargs="?",
+        help=f"Reservation token (default: ${TOKEN_ENV})",
     )
     sp_power.add_argument(
         "-q",
@@ -371,7 +396,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_flash.add_argument(
         "token",
-        help="Reservation token",
+        nargs="?",
+        help=f"Reservation token (default: ${TOKEN_ENV})",
     )
     sp_flash.add_argument(
         "path",
@@ -393,7 +419,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_status.add_argument(
         "token",
-        help="Reservation token",
+        nargs="?",
+        help=f"Reservation token (default: ${TOKEN_ENV})",
     )
     sp_status.set_defaults(func=cmd_status)
 
