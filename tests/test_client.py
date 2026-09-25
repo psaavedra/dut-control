@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import sys
 from pathlib import Path
 
@@ -73,3 +74,70 @@ def test_ssh_override_payload_rejects_bad_port(monkeypatch, capsys, value):
     assert excinfo.value.code == 1
     err = capsys.readouterr().err
     assert client_mod.CLIENT_SSH_PORT_ENV in err
+
+
+class FakeResponse:
+    """Enough of requests.Response for the subcommands."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self.payload
+
+
+RESERVATION = {
+    "status": 0,
+    "token": "abc123",
+    "dut-name": "rpi5-01",
+    "ip": "192.168.1.40",
+    "ssh-port": 22,
+    "tunnel-ssh-port": 5001,
+}
+
+
+@pytest.fixture
+def answers(monkeypatch):
+    """Reply to every POST with the given payload, recording the calls."""
+    def reply_with(payload):
+        calls = []
+
+        def post(url, json=None, timeout=None):
+            calls.append((url, json))
+            return FakeResponse(payload)
+
+        monkeypatch.setattr(client_mod.requests, "post", post)
+        monkeypatch.setenv(client_mod.CLIENT_KEY_ENV, "a-client-key")
+        return calls
+    return reply_with
+
+
+def test_reserve_prints_one_json_object(answers, capsys):
+    answers(RESERVATION)
+
+    assert client_mod.main(["reserve", "rpi5", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == RESERVATION
+
+
+def test_reserve_still_prints_its_lines_without_json(answers, capsys):
+    answers(RESERVATION)
+
+    assert client_mod.main(["reserve", "rpi5"]) == 0
+
+    out = capsys.readouterr().out
+    assert "token: abc123" in out
+    assert "dut-name: rpi5-01" in out
+    assert not out.startswith("{")
+
+
+def test_reserve_forwards_whatever_the_service_added(answers, capsys):
+    """The object is the response, so a new field needs no client change."""
+    answers({**RESERVATION, "lease-expires": "2026-01-01T00:00:00Z"})
+
+    client_mod.main(["reserve", "rpi5", "--json"])
+
+    assert json.loads(capsys.readouterr().out)["lease-expires"]

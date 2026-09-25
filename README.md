@@ -499,8 +499,8 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   rpi5                      3     1
   ```
 
-- **`reserve <pool>`**
-  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host
+- **`reserve <pool> [--json]`**
+  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
   Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used
@@ -522,6 +522,9 @@ export DUT_CONTROL_CLIENT_KEY=fac72a9494cd132a
 
 # Reserve a DUT from pool "rpi5"
 dut-control-client reserve rpi5
+
+# The same, for a script to parse
+TOKEN=$(dut-control-client reserve rpi5 --json | jq -r .token)
 
 # Same, from a host behind NAT reachable at 203.0.113.9:2222
 export DUT_CONTROL_CLIENT_SSH_IP=203.0.113.9
