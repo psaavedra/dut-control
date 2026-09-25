@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Dict
 
 import requests
@@ -19,6 +20,13 @@ CLIENT_SSH_PORT_ENV = "DUT_CONTROL_CLIENT_SSH_PORT"
 # A single DNS label, as on the service side
 _HOSTNAME_LABEL = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+# Every DUT in the pool is taken, or the client has no free port. Both
+# clear on their own; every other status is a mistake that will not.
+BUSY_STATUS = -4
+
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smh]?)$", re.IGNORECASE)
+_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
 
 def _full_url(base_url: str, path: str) -> str:
@@ -114,6 +122,16 @@ def _required_token(args: argparse.Namespace) -> str:
     return token
 
 
+def _duration(value: str) -> float:
+    """A wait, in seconds unless it carries an s, m or h suffix."""
+    match = _DURATION.match(value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration '{value}'; examples: 30, 30s, 5m, 1h")
+    amount, unit = match.groups()
+    return float(amount) * _UNIT_SECONDS[unit.lower() or "s"]
+
+
 def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
     status = data.get("status")
     err = data.get("error", "unknown error")
@@ -152,6 +170,33 @@ def cmd_pools(args: argparse.Namespace) -> None:
         )
 
 
+def _reserve(args: argparse.Namespace, payload: Dict[str, Any]) -> Dict:
+    """
+    Ask for a DUT, waiting out a pool that is merely busy.
+
+    Progress goes to stderr, so that --json leaves one object on stdout
+    however many attempts it took.
+    """
+    for attempt in range(args.retries + 1):
+        resp = requests.post(
+            _full_url(args.url, "/reserve"),
+            json=payload,
+            timeout=args.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("status") != BUSY_STATUS or attempt == args.retries:
+            return data
+
+        print(
+            f"pool {args.pool} is busy, retrying in "
+            f"{args.retries_wait:g}s",
+            file=sys.stderr,
+        )
+        time.sleep(args.retries_wait)
+
+
 def cmd_reserve(args: argparse.Namespace) -> None:
     client_key = os.environ.get(CLIENT_KEY_ENV)
     if not client_key:
@@ -161,17 +206,10 @@ def cmd_reserve(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    base_url = args.url
     payload = {"client-key": client_key, "pool": args.pool}
     payload.update(_ssh_override_payload())
 
-    resp = requests.post(
-        _full_url(base_url, "/reserve"),
-        json=payload,
-        timeout=args.timeout,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    data = _reserve(args, payload)
 
     if data.get("status") != 0:
         _print_error_and_exit("reserve failed", data)
@@ -336,6 +374,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Print the reservation as one JSON object",
+    )
+    sp_reserve.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Extra attempts while the pool is busy (default: %(default)s)",
+    )
+    sp_reserve.add_argument(
+        "--retries-wait",
+        type=_duration,
+        default="60s",
+        help="Wait between attempts, e.g. 30, 30s, 5m, 1h "
+             "(default: %(default)s)",
     )
     sp_reserve.set_defaults(func=cmd_reserve)
 

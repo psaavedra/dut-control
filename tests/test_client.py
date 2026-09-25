@@ -209,3 +209,105 @@ def test_lease_with_nothing_set_still_releases_everything(answers):
     client_mod.main(["lease"])
 
     assert "token" not in calls[0][1]
+
+
+BUSY = {"status": -4, "error": "no free duts for pool"}
+UNKNOWN_POOL = {"status": -2, "error": "pool does not exist"}
+
+
+@pytest.fixture
+def replies(monkeypatch):
+    """Answer each POST with the next payload; never really sleep."""
+    calls, waits = [], []
+
+    def reply_with(*payloads):
+        def post(url, json=None, timeout=None):
+            calls.append((url, json))
+            return FakeResponse(payloads[min(len(calls) - 1,
+                                             len(payloads) - 1)])
+
+        monkeypatch.setattr(client_mod.requests, "post", post)
+        monkeypatch.setattr(client_mod.time, "sleep", waits.append)
+        monkeypatch.setenv(client_mod.CLIENT_KEY_ENV, "a-client-key")
+        return calls, waits
+    return reply_with
+
+
+def test_a_busy_pool_is_waited_out(replies):
+    calls, waits = replies(BUSY, BUSY, RESERVATION)
+
+    assert client_mod.main(["reserve", "rpi5", "--retries", "5"]) == 0
+
+    assert len(calls) == 3
+    assert waits == [60.0, 60.0]
+
+
+def test_a_pool_that_does_not_exist_is_not_waited_out(replies, capsys):
+    """Retrying a typo for an hour helps nobody."""
+    calls, waits = replies(UNKNOWN_POOL)
+
+    with pytest.raises(SystemExit) as exit_info:
+        client_mod.main(["reserve", "rpi5", "--retries", "50"])
+
+    assert exit_info.value.code == 1
+    assert len(calls) == 1
+    assert waits == []
+    assert "pool does not exist" in capsys.readouterr().err
+
+
+def test_the_retries_run_out(replies, capsys):
+    calls, waits = replies(BUSY)
+
+    with pytest.raises(SystemExit):
+        client_mod.main(["reserve", "rpi5", "--retries", "2"])
+
+    assert len(calls) == 3
+    assert len(waits) == 2
+    assert "no free duts" in capsys.readouterr().err
+
+
+def test_nothing_is_retried_by_default(replies):
+    calls, waits = replies(BUSY)
+
+    with pytest.raises(SystemExit):
+        client_mod.main(["reserve", "rpi5"])
+
+    assert len(calls) == 1
+    assert waits == []
+
+
+def test_a_retry_leaves_json_alone(replies, capsys):
+    """Progress goes to stderr or it would corrupt the object."""
+    replies(BUSY, RESERVATION)
+
+    client_mod.main(["reserve", "rpi5", "--retries", "1", "--json"])
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == RESERVATION
+    assert "busy" in captured.err
+
+
+@pytest.mark.parametrize("given, seconds", [
+    ("30", 30.0),
+    ("30s", 30.0),
+    ("5m", 300.0),
+    ("1h", 3600.0),
+    ("1.5m", 90.0),
+    ("2 H", 7200.0),
+])
+def test_a_wait_may_carry_a_unit(replies, given, seconds):
+    _, waits = replies(BUSY, RESERVATION)
+
+    client_mod.main(["reserve", "rpi5", "--retries", "1",
+                     "--retries-wait", given])
+
+    assert waits == [seconds]
+
+
+@pytest.mark.parametrize("given", ["soon", "5 days", "-30", "", "m"])
+def test_a_wait_that_is_not_a_duration_is_refused(given):
+    with pytest.raises(SystemExit) as exit_info:
+        client_mod.build_parser().parse_args(
+            ["reserve", "rpi5", "--retries-wait", given])
+
+    assert exit_info.value.code == 2
