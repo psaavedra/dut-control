@@ -500,8 +500,8 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   rpi5                      3     1
   ```
 
-- **`reserve <pool> [--json]`**
-  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change
+- **`reserve <pool> [--json] [--retries N] [--retries-wait D]`**
+  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change. `--retries` waits out a pool whose DUTs are all taken (`status = -4`). `--retries-wait` is a number of seconds, or carries an `s`, `m` or `h` suffix.
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
   Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used. Given no filter at all, it releases the reservation named by `DUT_CONTROL_TOKEN` when that is set, and everything the client holds when it is not
@@ -526,6 +526,9 @@ dut-control-client reserve rpi5
 
 # The same, for a script to parse
 TOKEN=$(dut-control-client reserve rpi5 --json | jq -r .token)
+
+# Wait up to an hour for a busy pool
+dut-control-client reserve rpi5 --retries 60 --retries-wait 1m
 
 # Same, from a host behind NAT reachable at 203.0.113.9:2222
 export DUT_CONTROL_CLIENT_SSH_IP=203.0.113.9
