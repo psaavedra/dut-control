@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ipaddress
+import json
 import os
 import re
 import sys
@@ -157,6 +158,11 @@ def cmd_reserve(args: argparse.Namespace) -> None:
     if data.get("status") != 0:
         _print_error_and_exit("reserve failed", data)
 
+    # One object, so a caller parses a contract instead of a log format.
+    if args.json:
+        print(json.dumps(data))
+        return
+
     print(f"token: {data['token']}")
     print(f"dut-name: {data['dut-name']}")
     print(f"ip: {data['ip']}")
@@ -301,6 +307,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp_reserve.add_argument(
         "pool",
         help="Pool name (metadata.pools in DUT config)",
+    )
+    sp_reserve.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the reservation as one JSON object",
     )
     sp_reserve.set_defaults(func=cmd_reserve)
 
