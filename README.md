@@ -478,6 +478,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 - `DUT_CONTROL_URL` (optional): base URL of the service (default `http://localhost:8000`)
 - `DUT_CONTROL_CLIENT_KEY` (required for `reserve` and `lease`): client key matching configuration
+- `DUT_CONTROL_TOKEN` (optional): reservation token for `power`, `flash`, `status` and `lease`, used when none is given on the command line. Preferred over the positional argument on a shared host, where a token on a command line is readable in `ps` by every other user and ends up in any log that echoes the command
 - `DUT_CONTROL_CLIENT_SSH_IP` (optional): address the service must use to reach this host back, overriding the `ssh.ip` of its configuration entry
 - `DUT_CONTROL_CLIENT_SSH_PORT` (optional): port to use instead of the configured `ssh.port`
 
@@ -503,16 +504,16 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
-  Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used
+  Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used. Given no filter at all, it releases the reservation named by `DUT_CONTROL_TOKEN` when that is set, and everything the client holds when it is not
 
-- **`power <on|off|cycle> <token> [-q|--quiet]`**
-  Calls `/power/<action>` for the given reservation token; prints `power: ok` on success unless `--quiet` is used
+- **`power <on|off|cycle> [token] [-q|--quiet]`**
+  Calls `/power/<action>` for the given reservation token, or for `DUT_CONTROL_TOKEN`; prints `power: ok` on success unless `--quiet` is used
 
-- **`flash <token> <path> [-q|--quiet]`**
-  Calls `/flash` with the given token and image path; prints `flash: ok` on success unless `--quiet` is used
+- **`flash [token] <path> [-q|--quiet]`**
+  Calls `/flash` with the given token, or `DUT_CONTROL_TOKEN`, and the image path; prints `flash: ok` on success unless `--quiet` is used
 
-- **`status <token>`**
-  Calls `/dut/status` and prints one of `offline`, `ping`, or `ssh`
+- **`status [token]`**
+  Calls `/dut/status` for the given token, or `DUT_CONTROL_TOKEN`, and prints one of `offline`, `ping`, or `ssh`
 
 **Example usage**:
 
@@ -534,14 +535,20 @@ dut-control-client reserve rpi5
 # Release all reservations for this client
 dut-control-client lease --all
 
+# Keep the token out of every later command line
+export DUT_CONTROL_TOKEN=$(dut-control-client reserve rpi5 --json | jq -r .token)
+
 # Power cycle a reserved DUT
-dut-control-client power cycle "$TOKEN"
+dut-control-client power cycle
 
 # Flash an image for a reservation token
-dut-control-client flash "$TOKEN" /images/rpi5-image.wic
+dut-control-client flash /images/rpi5-image.wic
 
 # Check DUT status
-dut-control-client status "$TOKEN"
+dut-control-client status
+
+# Hand this reservation back
+dut-control-client lease
 ```
 
 ### dut-control-admin
