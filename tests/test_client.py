@@ -107,7 +107,7 @@ def answers(monkeypatch):
         calls = []
 
         def post(url, json=None, timeout=None):
-            calls.append((url, json))
+            calls.append((url, json, timeout))
             return FakeResponse(payload)
 
         monkeypatch.setattr(client_mod.requests, "post", post)
@@ -222,7 +222,7 @@ def replies(monkeypatch):
 
     def reply_with(*payloads):
         def post(url, json=None, timeout=None):
-            calls.append((url, json))
+            calls.append((url, json, timeout))
             return FakeResponse(payloads[min(len(calls) - 1,
                                              len(payloads) - 1)])
 
@@ -409,3 +409,43 @@ def test_a_size_that_is_not_a_size_is_refused(given):
             ["wipe", "a-token", "--size", given])
 
     assert exit_info.value.code == 2
+
+
+@pytest.mark.parametrize("command", [
+    ["pools"],
+    ["reserve", "rpi5"],
+    ["lease"],
+    ["power", "on", "a-token"],
+    ["status", "a-token"],
+])
+def test_most_requests_are_answered_at_once(answers, command):
+    calls = answers(RESERVATION)
+
+    client_mod.main(command)
+
+    assert calls[0][2] == client_mod.DEFAULT_TIMEOUT
+
+
+@pytest.mark.parametrize("command", [
+    ["flash", "a-token", "/images/rpi5.wic"],
+    ["wipe", "a-token"],
+])
+def test_writing_to_the_card_is_given_room(answers, command):
+    """The node settles a mux and writes over USB before answering."""
+    calls = answers(OK)
+
+    client_mod.main(command)
+
+    assert calls[0][2] == client_mod.STORAGE_TIMEOUT
+
+
+@pytest.mark.parametrize("command", [
+    ["--timeout", "5", "status", "a-token"],
+    ["--timeout", "5", "wipe", "a-token"],
+])
+def test_a_timeout_that_was_asked_for_wins(answers, command):
+    calls = answers(OK)
+
+    client_mod.main(command)
+
+    assert calls[0][2] == 5.0
