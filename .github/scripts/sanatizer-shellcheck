@@ -1,24 +1,24 @@
-#! /bin/bash
+#!/bin/bash
 
-if [[ $# -eq 0 ]]; then
-  scripts=$(find . -executable -type f ! -path '*/\.*' -exec grep -lE '^#! *(|/usr/bin/env +|/bin/|/usr/bin/)(sh|bash|dash)' {} +)
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/common.sh
+. "$here/common.sh"
+cd_repo_root
+
+tool="$(find_tool shellcheck)" || fatal "Could not find shellcheck"
+
+if [ $# -gt 0 ]; then
+    sources=("$@")
 else
-  scripts="$@"
+    mapfile -t sources < <(shell_sources)
 fi
-
-set -e
+if [ "${#sources[@]}" -eq 0 ]; then
+    echo "No shell sources to check."
+    exit 0
+fi
 
 echo "Running ShellCheck on the following scripts:"
-echo "$scripts"
-errors=0
+printf '%s\n' "${sources[@]}"
 
-for script in $scripts; do
-  if ! shellcheck -x "$script"; then
-    errors=$((errors + 1))
-  fi
-done
-if [ "$errors" -ne 0 ]; then
-  echo "ShellCheck found issues."
-  exit 1
-fi
+"$tool" -x "${sources[@]}" || fatal "ShellCheck found issues."
 echo "ShellCheck passed successfully."

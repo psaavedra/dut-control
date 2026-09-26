@@ -40,6 +40,11 @@ dut-control-admin = "dut_control.admin:main"
 test = [
   "pytest>=8.0",
 ]
+lint = [
+  "pycodestyle",
+  "pyflakes",
+  "radon",
+]
 
 [tool.setuptools.package-data]
 "dut_control" = ["data/**/*.yml"]

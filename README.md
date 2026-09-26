@@ -664,6 +664,15 @@ pip install ".[test]"
 pytest
 ```
 
+To run the same checks CI runs, install the linters too:
+
+```bash
+pip install ".[test,lint]"
+./.github/scripts/run-all-sanatizers
+```
+
+That runs radon, pycodestyle, pyflakes, shellcheck and a check on the commit messages on the branch. A linter that is not installed fails the run rather than being skipped quietly.
+
 ## License
 
 The project is licensed under the MIT License.
