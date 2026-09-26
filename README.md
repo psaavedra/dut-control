@@ -518,7 +518,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 **Global options**:
 
 - `-u, --url`: override base URL (default uses `DUT_CONTROL_URL` or built-in default)
-- `--timeout`: HTTP timeout in seconds (default 10.0)
+- `--timeout`: HTTP timeout in seconds (default 10, or 900 for `flash` and `wipe`). Those two wait for the node to settle the mux and write to the card, which no default meant for a lookup can cover. Being a global option it goes **before** the subcommand: `dut-control-client --timeout 1800 wipe`
 
 **Subcommands**:
 
