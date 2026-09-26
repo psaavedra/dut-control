@@ -1,34 +1,20 @@
-#! /bin/bash
+#!/bin/bash
 
-scripts=$(find . -type f ! -path '*/\.*' \( -executable -o -name '*.py' \) -exec grep -lE '^#! *(|/usr/bin/env +|/bin/|/usr/bin/)(python|python3)' {} +)
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/common.sh
+. "$here/common.sh"
+cd_repo_root
 
-set -e
+tool="$(find_tool pyflakes3 pyflakes)" || fatal "Could not find pyflakes"
 
-fatal() {
-  echo "$@"
-  exit 1
-}
-
-# Locate pyflakes.
-for cmd in pyflakes3 pyflakes; do
-  if which "$cmd" 2>/dev/null; then
-    pyflakes=$(which "$cmd")
-    break
-  fi
-done
-if [[ -z "$pyflakes" ]]; then
-  fatal "Could not find pyflakes"
+mapfile -t sources < <(python_sources)
+if [ "${#sources[@]}" -eq 0 ]; then
+    echo "No Python sources to check."
+    exit 0
 fi
 
 echo "Running pyflakes on the following scripts:"
-echo "$scripts"
-errors=0
-for script in $scripts; do
-  if ! $pyflakes "$script"; then
-    errors=$((errors + 1))
-  fi
-done
-if [ "$errors" -ne 0 ]; then
-  fatal "pyflakes found issues."
-fi
+printf '%s\n' "${sources[@]}"
+
+"$tool" "${sources[@]}" || fatal "pyflakes found issues."
 echo "pyflakes passed successfully."
