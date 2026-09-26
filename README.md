@@ -392,7 +392,7 @@ The service performs the following steps:
    - `usbsdmux <control> host`
    - `bmaptool copy --bmap <bmap> <image> <device>`, or `bmaptool copy --nobmap <image> <device>` when no `.bmap` was found
 4. Verifies the flash on the node by reading back the first image-size bytes of the device (direct I/O, bypassing the page cache) and comparing their SHA-256 checksum against the image's. For compressed images (`.gz`, `.bz2`, `.xz`, `.zst`, `.lz4`, `.lzo`, including compressed tarballs), which `bmaptool` decompresses while writing, the size and checksum are computed over the decompressed stream — the corresponding decompression tool must be available on the node. This step is skipped for `--bmap` copies (see **Block maps**)
-5. Runs `usbsdmux <control> dut` on the node to hand the storage back to the DUT (this happens even if verification fails, so the mux is left in a known state)
+5. Runs `usbsdmux <control> dut` on the node to hand the storage back to the DUT (this happens even if the flash or the verification fails, so the mux is left in a known state)
 
 Storage parameters (`control` and `device`) are read from the DUT `storage` configuration.
 

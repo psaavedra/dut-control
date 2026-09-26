@@ -1163,24 +1163,29 @@ def _flash_and_verify_on_node(
             f"bmaptool copy {bmap_arg} "
             f"{shlex.quote(node_tmp_path)} {shlex.quote(device)}"
         )
-        if not _run_node_command(node, flash_cmd):
-            raise RuntimeError("flash command failed on node")
+        flashed = _run_node_command(node, flash_cmd)
 
         # Verify while the card is still attached to the node, then
         # switch the mux back to the DUT whatever the outcome so it is
         # left in a known state. A failed switch-back is reported ahead
-        # of a checksum mismatch: a mux stuck on host needs operator
-        # action first.
+        # of the rest: a mux stuck on host needs operator action first.
         verified = True
-        if not node_bmap_path:
+        if flashed and not node_bmap_path:
             verified = _run_node_command(
                 node, _flash_verify_command(node_tmp_path, device))
         switched = _run_node_command(
             node, f"usbsdmux {shlex.quote(control)} dut")
+
         if not switched:
-            detail = "" if verified else " (image verification also failed)"
+            detail = ""
+            if not flashed:
+                detail = " (the flash also failed)"
+            elif not verified:
+                detail = " (image verification also failed)"
             raise RuntimeError(
                 "usbsdmux failed to switch storage back to dut" + detail)
+        if not flashed:
+            raise RuntimeError("flash command failed on node")
         if not verified:
             raise RuntimeError(
                 "flash verification failed: device content does not "
