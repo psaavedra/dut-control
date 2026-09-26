@@ -25,6 +25,11 @@ import yaml
 
 _USBSDMUX_SETTLE_DELAY = 5
 
+_MIB = 1024 ** 2
+# Enough to take out the partition table, /boot and the head of the
+# rootfs on the usual layouts.
+WIPE_DEFAULT_BYTES = 128 * _MIB
+
 _SSH_SKIP_HOST_CHECK = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
@@ -1115,22 +1120,22 @@ def _flash_verify_command(node_tmp_path: str, device: str) -> str:
     )
 
 
-# Serializes _flash_and_verify_on_node per node name: usbsdmux/bmaptool
-# operate on physical storage shared by all DUTs of a node, so a second
-# flash for the same node waits for the first to finish instead of
-# racing it. Keyed by name (not the node dict) so the lock survives a
-# /conf/reload, which replaces node dicts wholesale.
-_node_flash_locks: dict = {}
-_node_flash_locks_guard = threading.Lock()
+# Serializes node-side storage work per node name: usbsdmux, bmaptool
+# and dd operate on physical storage shared by all DUTs of a node, so a
+# second flash or wipe for the same node waits for the first to finish
+# instead of racing it. Keyed by name (not the node dict) so the lock
+# survives a /conf/reload, which replaces node dicts wholesale.
+_node_storage_locks: dict = {}
+_node_storage_locks_guard = threading.Lock()
 
 
-def _get_node_flash_lock(node_name: str):
-    """Return the flash lock for a node name, creating it on first use."""
-    with _node_flash_locks_guard:
-        lock = _node_flash_locks.get(node_name)
+def _get_node_storage_lock(node_name: str):
+    """Return the storage lock for a node name, creating it on first use."""
+    with _node_storage_locks_guard:
+        lock = _node_storage_locks.get(node_name)
         if lock is None:
             lock = threading.Lock()
-            _node_flash_locks[node_name] = lock
+            _node_storage_locks[node_name] = lock
         return lock
 
 
@@ -1149,7 +1154,7 @@ def _flash_and_verify_on_node(
     is then skipped: unmapped areas of the device keep whatever they
     held before, so a linear comparison would never match.
     """
-    with _get_node_flash_lock(node["name"]):
+    with _get_node_storage_lock(node["name"]):
         bmap_arg = ("--bmap " + shlex.quote(node_bmap_path)
                     if node_bmap_path else "--nobmap")
         flash_cmd = (
@@ -1180,6 +1185,66 @@ def _flash_and_verify_on_node(
             raise RuntimeError(
                 "flash verification failed: device content does not "
                 "match the image")
+
+
+def _wipe_on_node(node: dict, control: str, device: str,
+                  mebibytes: int):
+    """
+    Expose the SD card to the node, zero the head of it, and hand the
+    card back to the DUT.
+
+    As in _flash_and_verify_on_node, the switch back runs whatever the
+    outcome so the mux is left in a known state, and a failed switch
+    back is reported ahead of a failed write: a mux stuck on host needs
+    operator action first.
+    """
+    with _get_node_storage_lock(node["name"]):
+        # Asking for more than the card holds is a reasonable way to say
+        # "all of it", so the count is clamped on the node. Unclamped, dd
+        # stops at ENOSPC with a non-zero status and a wipe that did
+        # everything asked of it would read as a failure.
+        wipe_cmd = (
+            f"usbsdmux {shlex.quote(control)} host && "
+            f"sleep {_USBSDMUX_SETTLE_DELAY} && "
+            f"bytes=$(blockdev --getsize64 {shlex.quote(device)}) && "
+            f"count=$((bytes / {_MIB})) && "
+            f"count=$(({mebibytes} < count ? {mebibytes} : count)) && "
+            f"dd if=/dev/zero of={shlex.quote(device)} "
+            f"bs=1M count=$count oflag=direct conv=fsync"
+        )
+        wiped = _run_node_command(node, wipe_cmd)
+
+        switched = _run_node_command(
+            node, f"usbsdmux {shlex.quote(control)} dut")
+        if not switched:
+            detail = "" if wiped else " (the wipe also failed)"
+            raise RuntimeError(
+                "usbsdmux failed to switch storage back to dut" + detail)
+        if not wiped:
+            raise RuntimeError("wipe command failed on node")
+
+
+def _wipe_storage(node: dict, dut: dict, size_bytes: int):
+    """
+    Overwrite the head of the DUT storage with zeros, through the node.
+    """
+    storage = dut.get("storage", {})
+    control = storage.get("control")
+    device = storage.get("device")
+
+    if not control or not device:
+        raise RuntimeError("storage.control/device missing in config")
+
+    mebibytes = max(1, (size_bytes + _MIB - 1) // _MIB)
+
+    # As with a flash, a failure on the node points at a bad card or mux
+    # on this DUT, so take it out of rotation.
+    try:
+        _wipe_on_node(node, control, device, mebibytes)
+    except Exception:
+        with state_lock:
+            dut.setdefault("metadata", {})["enabled"] = False
+        raise
 
 
 def _run_scp(source: str, dest: str, port: int) -> bool:
@@ -1352,6 +1417,36 @@ def flash():
 
     try:
         _flash_image(node, dut, client, path)
+    except Exception as e:
+        return jsonify({"status": -99, "error": str(e)}), 200
+
+    return jsonify({"status": 0}), 200
+
+
+# ---------------------------------------------------------------------------
+# /wipe
+# ---------------------------------------------------------------------------
+
+@server.route("/wipe", methods=["POST", "PUT"])
+@validate_token
+def wipe():
+    body = request.get_json(silent=True) or {}
+    token = body.get("token")
+    size = body.get("size", WIPE_DEFAULT_BYTES)
+
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        return jsonify(
+            {"status": -99, "error": "size is not a positive number of "
+                                     "bytes"}), 200
+
+    reserve_entry = _get_reserve_by_token(token)
+
+    node, dut = _get_dut_and_node_by_name(reserve_entry["dut-name"])
+    if not node or not dut:
+        return jsonify({"status": -99, "error": "dut not found"}), 200
+
+    try:
+        _wipe_storage(node, dut, size)
     except Exception as e:
         return jsonify({"status": -99, "error": str(e)}), 200
 

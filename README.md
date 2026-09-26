@@ -22,6 +22,7 @@ Core pieces:
 - Lease/cleanup of reservations, including process and port management
 - Power control (on/off/cycle) via per-DUT scripts executed over SSH on the node
 - Image flashing pipeline using `scp`, `usbsdmux`, and `bmaptool` on the node
+- Quick storage wipe through the node, for handing a device back without leaving the last run on it
 - DUT reachability status: `offline`, `ping`, or `ssh`
 - Admin endpoints and CLI to inspect configuration, processes, and reservations and to prune expired entries
 
@@ -421,6 +422,36 @@ Step 3-5 (the node-side flash/verify/switch-back) is serialized per node: if two
 
 If the node-side step (3-5) fails; the flash command, the verification, or the mux switch-back; the service additionally marks the DUT as disabled (`metadata.enabled: false`), excluding it from new reservations; such a failure usually means a bad SD card or mux on that DUT. Existing reservations keep working. Re-enable it with `dut-control-admin dut-enable <dut-name>` (or `/conf/reload`) once fixed. Failures copying the image from the client (steps 1-2) do not disable the DUT.
 
+### Wipe storage: /wipe
+
+Overwrite the head of the DUT storage with zeros, through the node.
+
+- **Method**: `POST` (or `PUT`)
+- **Path**: `/wipe`
+- **Request body**:
+  - `token` (string, required): reservation token
+  - `size` (integer, optional): how many bytes to overwrite, rounded up to a whole MiB. Defaults to 128 MiB
+
+On the node, under the same per-node lock a flash takes, the service runs:
+
+- `usbsdmux <control> host`
+- `dd if=/dev/zero of=<device> bs=1M count=<N> oflag=direct conv=fsync`
+- `usbsdmux <control> dut`, whatever the outcome, so the mux is left in a known state
+
+This goes the same way a flash does rather than through the DUT itself, so it needs no SSH to the device, no credentials and no working userspace: it still runs after a test run that crashed it. And it overwrites blocks rather than unlinking files, so nothing is left in the free space for the next tenant to read back.
+
+What the 128 MiB default reaches depends on the image layout. On the usual one it takes out the partition table, so nothing mounts by label and the device will not boot, all of `/boot`, and the head of the root filesystem including its superblock. It does not reach a data partition sitting after the root filesystem. It is a quick wipe, not a scrub; raise `size` past the root filesystem if something must not survive on the card at all.
+
+**Responses**:
+
+- Invalid `size`: `{"status": -99, "error": "size is not a positive number of bytes"}`
+- Missing DUT in configuration: `{"status": -99, "error": "dut not found"}`
+- No storage configured: `{"status": -99, "error": "storage.control/device missing in config"}`
+- Wipe pipeline failure: `{"status": -99, "error": "..."}`
+- Success: `{"status": 0}`
+
+As with `/flash`, a failure on the node marks the DUT as disabled: it usually means a bad SD card or mux. Re-enable it with `dut-control-admin dut-enable <dut-name>` once fixed.
+
 ### DUT status: /dut/status
 
 Check simple reachability status for the DUT associated with a reservation.
@@ -512,6 +543,9 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 - **`flash [token] <path> [-q|--quiet]`**
   Calls `/flash` with the given token, or `DUT_CONTROL_TOKEN`, and the image path; prints `flash: ok` on success unless `--quiet` is used
 
+- **`wipe [token] [--size SIZE] [-q|--quiet]`**
+  Calls `/wipe` for the given token, or `DUT_CONTROL_TOKEN`. `--size` accepts `128MiB`, `512M`, `2G` or a plain byte count, and is left to the service when not given. `K`, `M` and `G` are 1024-based, and so are the `KB`/`MB`/`GB` spellings, which `dd` would read as 1000-based. Prints `wipe: ok` on success unless `--quiet` is used
+
 - **`status [token]`**
   Calls `/dut/status` for the given token, or `DUT_CONTROL_TOKEN`, and prints one of `offline`, `ping`, or `ssh`
 
@@ -556,6 +590,9 @@ dut-control-client status
 # Wait for it to finish booting after a power on
 dut-control-client power on
 dut-control-client wait --for ssh --retries 30 --retries-wait 10s
+
+# Clear the card before handing the device back
+dut-control-client wipe
 
 # Hand this reservation back
 dut-control-client lease
