@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict
 
 import requests
@@ -318,18 +319,62 @@ def cmd_power(args: argparse.Namespace) -> None:
         print("power: ok")
 
 
-def cmd_flash(args: argparse.Namespace) -> None:
-    base_url = args.url
-    payload = {"token": _required_token(args), "path": args.path}
+def _bmap_beside(image: Path):
+    """
+    The .bmap conventionally shipped next to an image, when there is
+    one: foo.wic.bz2 -> foo.wic.bmap, and foo.wic -> foo.wic.bmap.
+    Whichever of the two exists is the one.
+    """
+    for candidate in (image.with_suffix(".bmap"),
+                      image.with_name(image.name + ".bmap")):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _post_upload(args: argparse.Namespace, token: str):
+    """Send the image with the request, rather than naming it."""
+    image = Path(args.path)
+    if not image.is_file():
+        print(f"error: {image} is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    files = {"image": (image.name, image.open("rb"))}
+    bmap = _bmap_beside(image)
+    if bmap:
+        files["bmap"] = (bmap.name, bmap.open("rb"))
+
+    try:
+        return requests.post(
+            _full_url(args.url, "/flash"),
+            data={"token": token},
+            files=files,
+            timeout=_timeout(args, STORAGE_TIMEOUT),
+        )
+    finally:
+        for _, handle in files.values():
+            handle.close()
+
+
+def _post_path(args: argparse.Namespace, token: str):
+    """Name the image and let the service fetch it back by scp."""
+    payload = {"token": token, "path": args.path}
     # The service scp's the image off this host, so it needs the same
     # override, which may well have changed since the reservation.
     payload.update(_ssh_override_payload())
 
-    resp = requests.post(
-        _full_url(base_url, "/flash"),
+    return requests.post(
+        _full_url(args.url, "/flash"),
         json=payload,
         timeout=_timeout(args, STORAGE_TIMEOUT),
     )
+
+
+def cmd_flash(args: argparse.Namespace) -> None:
+    token = _required_token(args)
+    post = _post_upload if args.upload else _post_path
+
+    resp = post(args, token)
     resp.raise_for_status()
     data = resp.json()
 
@@ -537,8 +582,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_flash.add_argument(
         "path",
-        help="Path to image on the client host "
-             "(as seen from the dut-control service)",
+        help="Path to the image; on this host with --upload, on the "
+             "client host as the service sees it without",
+    )
+    sp_flash.add_argument(
+        "--upload",
+        action="store_true",
+        help="Send the image with the request instead of having the "
+             "service fetch it back over SSH",
     )
     sp_flash.add_argument(
         "-q",

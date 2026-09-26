@@ -103,7 +103,10 @@ dut-control/
 # dut-control/conf.yml
 ---
 admin-key: 6bdb3138229b7e45
+max-upload-bytes: 8589934592
 ```
+
+`max-upload-bytes` is optional and caps an uploaded image; it defaults to 8 GiB.
 
 The value of `admin-key` must be provided by admin clients when calling admin endpoints.
 
@@ -380,14 +383,27 @@ Flash an image onto DUT storage via the node.
 
 - **Method**: `POST` (or `PUT`)
 - **Path**: `/flash`
+There are two ways in, and the content type picks between them.
+
+**Naming the image** (`application/json`), where the service fetches it back off the client:
+
 - **Request body**:
   - `token` (string, required): reservation token
   - `path` (string, required): path to the image file as seen from the client host
   - `client-ssh-ip` (string, optional) and `client-ssh-port` (integer, optional): address the service must use to `scp` the image off the client, see [Client SSH overrides](#client-ssh-overrides). Accepted here as well as on `/reserve` because a client with a dynamic address may have moved since it reserved
 
-The service performs the following steps:
+**Uploading it** (`multipart/form-data`), where the client sends it with the request:
 
-1. Copies the image from the client to a temporary directory on the service host using `scp`
+- **Form fields**:
+  - `token` (required): reservation token
+  - `image` (file, required): the image itself, streamed to the service's staging directory
+  - `bmap` (file, optional): its block map. The service cannot go looking for one here, so a client that has it sends it
+
+Uploading asks nothing of the client but the request, so it works from a container, from behind NAT, and from anywhere the service has no SSH route back to. The filename is reduced to a bare name before it is used, and the request is capped by `max-upload-bytes` in `conf.yml` (8 GiB by default); over that, the reply is `{"status": -99, "error": "upload is larger than ..."}` rather than an HTTP error page.
+
+Once the image is staged, both modes are the same. The service performs the following steps:
+
+1. Copies the image from the client to a temporary directory on the service host using `scp`, or takes it from the upload
 2. Copies the image from the service host to the node under `/tmp/` using `scp`, together with the image's `.bmap` file when one exists (see **Block maps** below)
 3. On the node, runs:
    - `usbsdmux <control> host`
@@ -541,8 +557,8 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 - **`power <on|off|cycle> [token] [-q|--quiet]`**
   Calls `/power/<action>` for the given reservation token, or for `DUT_CONTROL_TOKEN`; prints `power: ok` on success unless `--quiet` is used
 
-- **`flash [token] <path> [-q|--quiet]`**
-  Calls `/flash` with the given token, or `DUT_CONTROL_TOKEN`, and the image path; prints `flash: ok` on success unless `--quiet` is used
+- **`flash [token] <path> [--upload] [-q|--quiet]`**
+  Calls `/flash` with the given token, or `DUT_CONTROL_TOKEN`, and the image path; prints `flash: ok` on success unless `--quiet` is used. `--upload` sends the image with the request instead, taking `path` as a local file and bringing along the `.bmap` beside it when there is one; use it when the service has no SSH route back to this host
 
 - **`wipe [token] [--size SIZE] [-q|--quiet]`**
   Calls `/wipe` for the given token, or `DUT_CONTROL_TOKEN`. `--size` accepts `128MiB`, `512M`, `2G` or a plain byte count, and is left to the service when not given. `K`, `M` and `G` are 1024-based, and so are the `KB`/`MB`/`GB` spellings, which `dd` would read as 1000-based. Prints `wipe: ok` on success unless `--quiet` is used
@@ -584,6 +600,9 @@ dut-control-client power cycle
 
 # Flash an image for a reservation token
 dut-control-client flash /images/rpi5-image.wic
+
+# The same, from a host the service cannot reach back
+dut-control-client flash --upload ./rpi5-image.wic.bz2
 
 # Check DUT status
 dut-control-client status
