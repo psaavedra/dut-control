@@ -1,43 +1,53 @@
 #!/bin/bash
 
-set -e
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/common.sh
+. "$here/common.sh"
+cd_repo_root
 
 echo "Running git commit log messages check:"
 
-error_found=0
-
-baseref="main"
+baseref="${GITHUB_BASE_REF:-main}"
 headref="HEAD"
 
-git fetch origin $baseref 2>&1 > /dev/null
-
-if [[ -n "${GITHUB_HEAD_REF}" ]]; then
-    headref="origin/${GITHUB_HEAD_REF}"
-    git fetch origin ${GITHUB_HEAD_REF} 2>&1 > /dev/null
+if git remote get-url origin >/dev/null 2>&1; then
+    git fetch -q origin "$baseref"
+    if [ -n "$GITHUB_HEAD_REF" ]; then
+        git fetch -q origin "$GITHUB_HEAD_REF"
+        headref="origin/$GITHUB_HEAD_REF"
+    fi
+    range="origin/$baseref..$headref"
+else
+    # No remote yet: there is no base to compare against, so check
+    # every commit on this branch.
+    echo "No origin remote; checking all commits on $headref."
+    range="$headref"
 fi
 
-# Get commit messages
-commits=$(git log origin/${baseref}..${headref} --pretty=format:"%s")
-echo "$commits" > commit_messages.txt
-
-# Check commit messages format
-while IFS= read -r line; do
-  if ! [[ "${line}" =~ ^[a-zA-Z0-9,_\-]+:\ .+$ ]]; then
-    echo "Invalid commit message: $line"
-    error_found=1
-  fi
-done < commit_messages.txt
-
-# Get full commit messages
-commits=$(git log origin/${baseref}..${headref} --pretty=format:"%B")
-echo "$commits" > commit_messages.txt
-
-# Check for required keywords (case-insensitive)
-if ! grep -iqE 'Change-type:|Maintenance-type:' commit_messages.txt; then
-    echo "Error: No commit message contains 'Change-type:' or 'Maintenance-type:'."
-    error_found=1
+if [ -z "$(git log "$range" --format=%s)" ]; then
+    echo "No commits to check."
+    exit 0
 fi
 
-rm commit_messages.txt
-# Exit with the appropriate status
-exit $error_found
+errors=0
+
+# --format terminates every subject with a newline; --pretty=format:
+# omits the last one, and read would then drop the final commit.
+while IFS= read -r subject; do
+    if ! [[ "$subject" =~ ^[a-zA-Z0-9,_-]+:\ .+$ ]]; then
+        echo "Invalid commit message: $subject"
+        errors=1
+    fi
+done < <(git log "$range" --format=%s)
+
+# Dependabot writes its own messages and cannot add a trailer.
+if [[ "$GITHUB_HEAD_REF" == dependabot/* ]]; then
+    echo "Dependabot branch; not asking it for a Change-type."
+elif ! git log "$range" --format=%B |
+        grep -iqE 'Change-type:|Maintenance-type:'; then
+    echo "Error: no commit contains 'Change-type:' or 'Maintenance-type:'."
+    errors=1
+fi
+
+[ "$errors" -eq 0 ] || fatal "git commit log messages found issues."
+echo "git commit log messages passed successfully."
