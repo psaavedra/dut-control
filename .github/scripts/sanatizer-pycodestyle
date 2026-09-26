@@ -1,34 +1,21 @@
-#! /bin/bash
+#!/bin/bash
 
-scripts=$(find . -type f ! -path '*/\.*' \( -executable -o -name '*.py' \) -exec grep -lE '^#! *(|/usr/bin/env +|/bin/|/usr/bin/)(python|python3)' {} +)
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/common.sh
+. "$here/common.sh"
+cd_repo_root
 
-set -e
+tool="$(find_tool pycodestyle3 pycodestyle)" ||
+    fatal "Could not find pycodestyle"
 
-fatal() {
-  echo "$@"
-  exit 1
-}
-
-# Locate pycodestyle.
-for cmd in pycodestyle3 pycodestyle; do
-  if which "$cmd" 2>/dev/null; then
-    pycodestyle=$(which "$cmd")
-    break
-  fi
-done
-if [[ -z "$pycodestyle" ]]; then
-  fatal "Could not find pycodestyle"
+mapfile -t sources < <(python_sources)
+if [ "${#sources[@]}" -eq 0 ]; then
+    echo "No Python sources to check."
+    exit 0
 fi
 
 echo "Running pycodestyle on the following scripts:"
-echo "$scripts"
-errors=0
-for script in $scripts; do
-  if ! $pycodestyle "$script"; then
-    errors=$((errors + 1))
-  fi
-done
-if [ "$errors" -ne 0 ]; then
-  fatal "pycodestyle found issues."
-fi
+printf '%s\n' "${sources[@]}"
+
+"$tool" "${sources[@]}" || fatal "pycodestyle found issues."
 echo "pycodestyle passed successfully."
