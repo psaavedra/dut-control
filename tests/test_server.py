@@ -2055,3 +2055,172 @@ def test_flash_rejects_invalid_client_ssh_ip(flask_client, monkeypatch):
 
     with server_mod.state_lock:
         assert client["ssh"]["ip"] == "192.0.2.10"
+
+
+# ---------------------------------------------------------------------------
+# /wipe
+# ---------------------------------------------------------------------------
+
+def _reserved_dut(pool="pool-01", token="token-wipe"):
+    """A client, a node, a DUT and a live reservation for it."""
+    client = _make_client()
+    node, dut = _make_node_dut(pool=pool)
+    dut["storage"] = {"control": "/dev/sg1", "device": "/dev/sda1"}
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+        now = int(time.time())
+        server_mod.reserves.append(
+            {
+                "token": token,
+                "valid-from": now - 10,
+                "valid-until": now + 3600,
+                "client-key": client["key"],
+                "dut-name": dut["name"],
+            }
+        )
+    return node, dut, token
+
+
+def test_wipe_defaults_to_the_head_of_the_storage(flask_client, monkeypatch):
+    _, _, token = _reserved_dut(token="token-wipe-default")
+    seen = {}
+
+    def fake_wipe(node, dut, size_bytes):
+        seen["size"] = size_bytes
+
+    monkeypatch.setattr(server_mod, "_wipe_storage", fake_wipe)
+
+    resp = flask_client.post("/wipe", json={"token": token})
+
+    assert resp.get_json()["status"] == 0
+    assert seen["size"] == server_mod.WIPE_DEFAULT_BYTES
+
+
+@pytest.mark.parametrize("size", [0, -1, "128MiB", 1.5, True, None])
+def test_wipe_refuses_a_size_that_is_not_a_count_of_bytes(
+        flask_client, monkeypatch, size):
+    _, _, token = _reserved_dut(token="token-wipe-badsize")
+    monkeypatch.setattr(server_mod, "_wipe_storage",
+                        lambda *a: pytest.fail("should not have run"))
+
+    resp = flask_client.post("/wipe", json={"token": token, "size": size})
+
+    data = resp.get_json()
+    assert data["status"] == -99
+    assert "size" in data["error"]
+
+
+def test_wipe_reports_a_failure_verbatim(flask_client, monkeypatch):
+    _, _, token = _reserved_dut(token="token-wipe-fail")
+
+    def fake_wipe(node, dut, size_bytes):
+        raise RuntimeError("wipe command failed on node")
+
+    monkeypatch.setattr(server_mod, "_wipe_storage", fake_wipe)
+
+    data = flask_client.post("/wipe", json={"token": token}).get_json()
+
+    assert data["status"] == -99
+    assert data["error"] == "wipe command failed on node"
+
+
+def test_wipe_zeroes_the_device_through_the_node(monkeypatch):
+    node, dut, _ = _reserved_dut(token="token-wipe-node")
+    commands = []
+
+    monkeypatch.setattr(server_mod, "_run_node_command",
+                        lambda n, cmd: commands.append(cmd) or True)
+
+    server_mod._wipe_storage(node, dut, 2 * server_mod._MIB)
+
+    assert len(commands) == 2
+    assert "usbsdmux /dev/sg1 host" in commands[0]
+    assert "dd if=/dev/zero of=/dev/sda1 bs=1M count=$count" in commands[0]
+    assert "oflag=direct" in commands[0]
+    assert commands[1] == "usbsdmux /dev/sg1 dut"
+
+
+def test_wipe_never_asks_for_more_than_the_card_holds(monkeypatch):
+    """Running past the end is ENOSPC, which would read as a failure."""
+    node, dut, _ = _reserved_dut(token="token-wipe-clamp")
+    commands = []
+    monkeypatch.setattr(server_mod, "_run_node_command",
+                        lambda n, cmd: commands.append(cmd) or True)
+
+    server_mod._wipe_storage(node, dut, 64 * 1024 ** 3)
+
+    assert "blockdev --getsize64 /dev/sda1" in commands[0]
+    assert "count=$((65536 < count ? 65536 : count))" in commands[0]
+
+
+def test_wipe_rounds_a_partial_mebibyte_up(monkeypatch):
+    node, dut, _ = _reserved_dut(token="token-wipe-round")
+    commands = []
+    monkeypatch.setattr(server_mod, "_run_node_command",
+                        lambda n, cmd: commands.append(cmd) or True)
+
+    server_mod._wipe_storage(node, dut, server_mod._MIB + 1)
+
+    assert "(2 < count ? 2 : count)" in commands[0]
+
+
+def test_a_stuck_mux_is_reported_before_anything_else(monkeypatch):
+    """A mux left on host needs operator action, so it comes first."""
+    node, dut, _ = _reserved_dut(token="token-wipe-stuck")
+
+    monkeypatch.setattr(server_mod, "_run_node_command",
+                        lambda n, cmd: not cmd.endswith(" dut"))
+
+    with pytest.raises(RuntimeError, match="switch storage back to dut"):
+        server_mod._wipe_storage(node, dut, server_mod._MIB)
+
+
+def test_the_card_goes_back_to_the_dut_after_a_failed_wipe(monkeypatch):
+    """Otherwise a bad card would also leave the mux on host."""
+    node, dut, _ = _reserved_dut(token="token-wipe-back")
+    commands = []
+
+    def fake_run(n, cmd):
+        commands.append(cmd)
+        return cmd.endswith(" dut")
+
+    monkeypatch.setattr(server_mod, "_run_node_command", fake_run)
+
+    with pytest.raises(RuntimeError, match="wipe command failed on node"):
+        server_mod._wipe_storage(node, dut, server_mod._MIB)
+
+    assert commands[-1] == "usbsdmux /dev/sg1 dut"
+
+
+def test_both_failing_reports_the_mux_and_mentions_the_wipe(monkeypatch):
+    node, dut, _ = _reserved_dut(token="token-wipe-both")
+
+    monkeypatch.setattr(server_mod, "_run_node_command",
+                        lambda n, cmd: False)
+
+    with pytest.raises(RuntimeError,
+                       match="switch storage back to dut.*wipe also failed"):
+        server_mod._wipe_storage(node, dut, server_mod._MIB)
+
+
+def test_a_dut_that_cannot_be_wiped_leaves_the_pool(monkeypatch):
+    """The same reasoning as a failed flash: bad card or bad mux."""
+    node, dut, _ = _reserved_dut(token="token-wipe-disable")
+
+    monkeypatch.setattr(server_mod, "_run_node_command",
+                        lambda n, cmd: cmd.endswith(" dut"))
+
+    with pytest.raises(RuntimeError, match="wipe command failed"):
+        server_mod._wipe_storage(node, dut, server_mod._MIB)
+
+    assert dut["metadata"]["enabled"] is False
+
+
+def test_wipe_needs_a_dut_with_storage(monkeypatch):
+    node, dut, _ = _reserved_dut(token="token-wipe-nostorage")
+    dut["storage"] = {}
+
+    with pytest.raises(RuntimeError, match="storage.control/device missing"):
+        server_mod._wipe_storage(node, dut, server_mod._MIB)
