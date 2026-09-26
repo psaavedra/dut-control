@@ -311,3 +311,58 @@ def test_a_wait_that_is_not_a_duration_is_refused(given):
             ["reserve", "rpi5", "--retries-wait", given])
 
     assert exit_info.value.code == 2
+
+
+def reachable(*states):
+    return [{"status": state} for state in states]
+
+
+def test_wait_returns_as_soon_as_the_dut_answers_ssh(replies, capsys):
+    calls, waits = replies(*reachable("offline", "ping", "ssh"))
+
+    assert client_mod.main(["wait", "a-token"]) == 0
+
+    assert len(calls) == 3
+    assert waits == [10.0, 10.0]
+    assert capsys.readouterr().out == "ssh\n"
+
+
+def test_waiting_for_ping_is_satisfied_by_ssh(replies):
+    """A DUT answering SSH answers ping; the states are a ladder."""
+    calls, _ = replies(*reachable("ssh"))
+
+    client_mod.main(["wait", "a-token", "--for", "ping"])
+
+    assert len(calls) == 1
+
+
+def test_wait_gives_up_and_says_what_it_saw(replies, capsys):
+    calls, waits = replies(*reachable("offline"))
+
+    with pytest.raises(SystemExit) as exit_info:
+        client_mod.main(["wait", "a-token", "--retries", "3",
+                         "--retries-wait", "5s"])
+
+    assert exit_info.value.code == 1
+    assert len(calls) == 4
+    assert waits == [5.0, 5.0, 5.0]
+    assert "gave up waiting for ssh; dut is offline" in \
+        capsys.readouterr().err
+
+
+def test_wait_takes_the_token_from_the_environment(replies, monkeypatch):
+    calls, _ = replies(*reachable("ssh"))
+    monkeypatch.setenv(client_mod.TOKEN_ENV, "from-the-environment")
+
+    client_mod.main(["wait"])
+
+    assert calls[0][1] == {"token": "from-the-environment"}
+
+
+def test_a_state_nobody_knows_is_not_the_one_we_asked_for(replies):
+    calls, _ = replies(*reachable("rebooting"))
+
+    with pytest.raises(SystemExit):
+        client_mod.main(["wait", "a-token", "--retries", "0"])
+
+    assert len(calls) == 1
