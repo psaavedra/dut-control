@@ -366,3 +366,46 @@ def test_a_state_nobody_knows_is_not_the_one_we_asked_for(replies):
         client_mod.main(["wait", "a-token", "--retries", "0"])
 
     assert len(calls) == 1
+
+
+def test_wipe_sends_the_size_in_bytes(answers):
+    calls = answers(OK)
+
+    assert client_mod.main(["wipe", "a-token", "--size", "256MiB"]) == 0
+
+    assert calls[0][1] == {"token": "a-token", "size": 256 * 1024 ** 2}
+
+
+def test_wipe_leaves_the_default_size_to_the_service(answers):
+    calls = answers(OK)
+
+    client_mod.main(["wipe", "a-token"])
+
+    assert calls[0][1] == {"token": "a-token"}
+
+
+@pytest.mark.parametrize("given, expected", [
+    ("512", 512),
+    ("512B", 512),
+    ("64K", 64 * 1024),
+    ("128M", 128 * 1024 ** 2),
+    ("128MiB", 128 * 1024 ** 2),
+    ("128MB", 128 * 1024 ** 2),
+    ("2G", 2 * 1024 ** 3),
+])
+def test_a_size_may_carry_a_unit(answers, given, expected):
+    """K, M and G are binary, as in dd."""
+    calls = answers(OK)
+
+    client_mod.main(["wipe", "a-token", "--size", given])
+
+    assert calls[0][1]["size"] == expected
+
+
+@pytest.mark.parametrize("given", ["lots", "128X", "", "-1", "1.5M", "0"])
+def test_a_size_that_is_not_a_size_is_refused(given):
+    with pytest.raises(SystemExit) as exit_info:
+        client_mod.build_parser().parse_args(
+            ["wipe", "a-token", "--size", given])
+
+    assert exit_info.value.code == 2
