@@ -14,9 +14,9 @@ authors = [
   { name = "Pablo Saavedra", email = "psaavedra@igalia.com" }
 ]
 
+# What the client and admin CLIs need. The service adds to this; see
+# the server extra below.
 dependencies = [
-  "flask>=2.3",
-  "pyyaml>=6.0",
   "requests>=2.31",
 ]
 
@@ -37,8 +37,13 @@ dut-control-client = "dut_control.client:main"
 dut-control-admin = "dut_control.admin:main"
 
 [project.optional-dependencies]
+server = [
+  "flask>=2.3",
+  "pyyaml>=6.0",
+]
 test = [
   "pytest>=8.0",
+  "dut-control[server]",
 ]
 lint = [
   "pycodestyle",
