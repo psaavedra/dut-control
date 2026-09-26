@@ -31,6 +31,11 @@ REACHABILITY = ("offline", "ping", "ssh")
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smh]?)$", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
+# An HTTP request the service answers as soon as it has looked at it.
+DEFAULT_TIMEOUT = 10.0
+# One where it first settles a mux and writes to an SD card over USB.
+STORAGE_TIMEOUT = 900.0
+
 _SIZE = re.compile(r"^(\d+)\s*([kmg])?i?b?$", re.IGNORECASE)
 _UNIT_BYTES = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
 
@@ -138,6 +143,12 @@ def _duration(value: str) -> float:
     return float(amount) * _UNIT_SECONDS[unit.lower() or "s"]
 
 
+def _timeout(args: argparse.Namespace,
+             default: float = DEFAULT_TIMEOUT) -> float:
+    """What the caller asked for, or what this request usually needs."""
+    return default if args.timeout is None else args.timeout
+
+
 def _size(value: str) -> int:
     """A size in bytes; K, M and G are binary, as in dd."""
     match = _SIZE.match(value.strip())
@@ -170,7 +181,7 @@ def cmd_pools(args: argparse.Namespace) -> None:
     resp = requests.post(
         _full_url(args.url, "/pools"),
         json={"client-key": client_key},
-        timeout=args.timeout,
+        timeout=_timeout(args),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -200,7 +211,7 @@ def _reserve(args: argparse.Namespace, payload: Dict[str, Any]) -> Dict:
         resp = requests.post(
             _full_url(args.url, "/reserve"),
             json=payload,
-            timeout=args.timeout,
+            timeout=_timeout(args),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -275,7 +286,7 @@ def cmd_lease(args: argparse.Namespace) -> None:
     resp = requests.post(
         _full_url(base_url, "/lease"),
         json=payload,
-        timeout=args.timeout,
+        timeout=_timeout(args),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -295,7 +306,7 @@ def cmd_power(args: argparse.Namespace) -> None:
     resp = requests.post(
         _full_url(base_url, f"/power/{args.action}"),
         json=payload,
-        timeout=args.timeout,
+        timeout=_timeout(args),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -317,7 +328,7 @@ def cmd_flash(args: argparse.Namespace) -> None:
     resp = requests.post(
         _full_url(base_url, "/flash"),
         json=payload,
-        timeout=args.timeout,
+        timeout=_timeout(args, STORAGE_TIMEOUT),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -338,7 +349,7 @@ def cmd_wipe(args: argparse.Namespace) -> None:
     resp = requests.post(
         _full_url(args.url, "/wipe"),
         json=payload,
-        timeout=args.timeout,
+        timeout=_timeout(args, STORAGE_TIMEOUT),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -355,7 +366,7 @@ def _dut_status(args: argparse.Namespace, token: str) -> str:
     resp = requests.post(
         _full_url(args.url, "/dut/status"),
         json={"token": token},
-        timeout=args.timeout,
+        timeout=_timeout(args),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -420,8 +431,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--timeout",
         type=float,
-        default=10.0,
-        help="HTTP request timeout in seconds (default: %(default)s)",
+        default=None,
+        help=f"HTTP request timeout in seconds (default: "
+             f"{DEFAULT_TIMEOUT:g}, or {STORAGE_TIMEOUT:g} for flash and "
+             f"wipe, which wait for the node to write to the card)",
     )
 
     sub = p.add_subparsers(dest="command", required=True)
