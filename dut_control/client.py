@@ -31,6 +31,9 @@ REACHABILITY = ("offline", "ping", "ssh")
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smh]?)$", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
+_SIZE = re.compile(r"^(\d+)\s*([kmg])?i?b?$", re.IGNORECASE)
+_UNIT_BYTES = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
+
 
 def _full_url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
@@ -133,6 +136,19 @@ def _duration(value: str) -> float:
             f"invalid duration '{value}'; examples: 30, 30s, 5m, 1h")
     amount, unit = match.groups()
     return float(amount) * _UNIT_SECONDS[unit.lower() or "s"]
+
+
+def _size(value: str) -> int:
+    """A size in bytes; K, M and G are binary, as in dd."""
+    match = _SIZE.match(value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid size '{value}'; examples: 128MiB, 512M, 2G")
+    amount, unit = match.groups()
+    size = int(amount) * _UNIT_BYTES[(unit or "").lower()]
+    if size <= 0:
+        raise argparse.ArgumentTypeError("a size of zero wipes nothing")
+    return size
 
 
 def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
@@ -311,6 +327,27 @@ def cmd_flash(args: argparse.Namespace) -> None:
 
     if not args.quiet:
         print("flash: ok")
+
+
+def cmd_wipe(args: argparse.Namespace) -> None:
+    payload: Dict[str, Any] = {"token": _required_token(args)}
+    # Left out when not asked for, so the default lives in one place.
+    if args.size is not None:
+        payload["size"] = args.size
+
+    resp = requests.post(
+        _full_url(args.url, "/wipe"),
+        json=payload,
+        timeout=args.timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") != 0:
+        _print_error_and_exit("wipe failed", data)
+
+    if not args.quiet:
+        print("wipe: ok")
 
 
 def _dut_status(args: argparse.Namespace, token: str) -> str:
@@ -509,6 +546,30 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Reservation token (default: ${TOKEN_ENV})",
     )
     sp_status.set_defaults(func=cmd_status)
+
+    # wipe
+    sp_wipe = sub.add_parser(
+        "wipe",
+        help="Zero the head of the DUT storage",
+    )
+    sp_wipe.add_argument(
+        "token",
+        nargs="?",
+        help=f"Reservation token (default: ${TOKEN_ENV})",
+    )
+    sp_wipe.add_argument(
+        "--size",
+        type=_size,
+        help="How much to overwrite, e.g. 128MiB, 512M, 2G "
+             "(default: whatever the service uses)",
+    )
+    sp_wipe.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Do not print anything on success",
+    )
+    sp_wipe.set_defaults(func=cmd_wipe)
 
     # wait
     sp_wait = sub.add_parser(
