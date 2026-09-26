@@ -26,6 +26,9 @@ import yaml
 _USBSDMUX_SETTLE_DELAY = 5
 
 _MIB = 1024 ** 2
+# The endpoint takes bytes from anyone holding a valid token, so the
+# service host's disk needs a ceiling. conf.yml can raise or lower it.
+MAX_UPLOAD_BYTES = 8 * 1024 ** 3
 # Enough to take out the partition table, /boot and the head of the
 # rootfs on the usual layouts.
 WIPE_DEFAULT_BYTES = 128 * _MIB
@@ -107,11 +110,16 @@ def validate_pool(func):
     return wrapper
 
 
+def _request_token():
+    """The token, from a JSON body or from a multipart form."""
+    body = request.get_json(silent=True) or {}
+    return body.get("token") or request.form.get("token")
+
+
 def validate_token(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
-        body = request.get_json(silent=True) or {}
-        token = body.get("token")
+        token = _request_token()
         if not token:
             return jsonify({"status": -1, "error": "token missing"}), 200
 
@@ -221,10 +229,9 @@ def _load_conf(config_dir: Path):
                 merged.update(item)
         data = merged
 
-    key = data.get("admin-key")
-    if not key:
+    if not data.get("admin-key"):
         raise ValueError("conf.yml must contain 'admin-key'")
-    return key
+    return data
 
 
 def _load_nodes(config_dir: Path):
@@ -300,12 +307,14 @@ def reload_config():
     """
     global admin_key, nodes, clients
 
-    new_admin_key = _load_conf(CONFIG_DIR)
+    conf = _load_conf(CONFIG_DIR)
     new_nodes = _load_nodes(CONFIG_DIR)
     new_clients = _load_clients(CONFIG_DIR)
 
     with state_lock:
-        admin_key = new_admin_key
+        admin_key = conf["admin-key"]
+        server.config["MAX_CONTENT_LENGTH"] = int(
+            conf.get("max-upload-bytes", MAX_UPLOAD_BYTES))
         nodes[:] = new_nodes
         clients[:] = new_clients
 
@@ -1273,38 +1282,32 @@ def _remote_spec(ssh: dict, path: str) -> str:
     return f"{ssh.get('user', 'root')}@{ssh['ip']}:{shlex.quote(path)}"
 
 
-def _stage_optional_bmap(client: dict, node: dict, client_path: str,
-                         tmpdir: str, unique_suffix: str):
+def _fetch_optional_bmap(client: dict, client_path: str, tmpdir: str):
     """
-    Best-effort staging of the .bmap file shipped next to the image
-    (client -> service -> node). Returns the node-side path, or None
-    when the image has no bmap or it could not be staged, in which case
-    the flash falls back to --nobmap.
+    Best-effort copy of the .bmap file shipped next to the image on the
+    client. Returns the local path, or None when the image has no bmap
+    or it could not be fetched, in which case the flash falls back to
+    --nobmap.
 
-    A partial local copy left by a failed scp needs no handling here:
-    it lives in tmpdir, which the caller removes wholesale.
+    A partial copy left by a failed scp needs no handling here: it
+    lives in tmpdir, which the caller removes wholesale.
     """
     bmap_client_path = _bmap_path_for_image(client_path)
     if not bmap_client_path:
         return None
 
-    bmap_name = os.path.basename(bmap_client_path)
-    local_path = str(Path(tmpdir) / bmap_name)
-    node_path = f"/tmp/{unique_suffix}-{bmap_name}"
-
+    local_path = str(Path(tmpdir) / os.path.basename(bmap_client_path))
     client_ssh = client["ssh"]
     if not _run_scp(_remote_spec(client_ssh, bmap_client_path), local_path,
                     int(client_ssh.get("port", 22))):
         return None
+    return local_path
 
+
+def _push_to_node(node: dict, local_path: str, node_path: str) -> bool:
     node_ssh = node["ssh"]
-    if not _run_scp(local_path, _remote_spec(node_ssh, node_path),
-                    int(node_ssh.get("port", 22))):
-        # A failed push can still leave a partial copy on the node
-        _run_node_command(node, f"rm -f {shlex.quote(node_path)}")
-        return None
-
-    return node_path
+    return _run_scp(local_path, _remote_spec(node_ssh, node_path),
+                    int(node_ssh.get("port", 22)))
 
 
 def _cleanup_flash_temps(node: dict, tmpdir: str, node_paths):
@@ -1323,17 +1326,17 @@ def _cleanup_flash_temps(node: dict, tmpdir: str, node_paths):
         _run_node_command(node, f"rm -f {remote}")
 
 
-def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
+def _push_and_flash(node: dict, dut: dict, tmpdir: str, local_image: str,
+                    local_bmap: str = None):
     """
-    1. scp image from client -> service temp dir
-    2. scp image from service temp dir -> node temp dir, together with
-       the matching .bmap file when the image ships one
-    3. ssh to node: run usbsdmux/bmaptool using storage info, then read
-       the device back and compare checksums to confirm the flash took
-       (read-back skipped for bmap copies, see _flash_and_verify_on_node)
+    Copy a staged image, and its bmap when there is one, to the node,
+    flash it, and sweep the copies away.
 
-    Requires passwordless SSH/SCP from the service host to both client and
-    node.
+    tempfile.mkdtemp() gave the caller a unique local directory, so the
+    staged files never collide across concurrent flashes. The node side
+    has no such directory of its own, so the same unique suffix keeps
+    the node paths collision-free when the same image name is flashed
+    to the same node twice at once.
     """
     storage = dut.get("storage", {})
     control = storage.get("control")  # e.g. /dev/sg2
@@ -1342,44 +1345,29 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
     if not control or not device:
         raise RuntimeError("storage.control/device missing in config")
 
-    client_ssh = client["ssh"]
-    node_ssh = node["ssh"]
-
-    # Normalize basename once; we reuse it for local and remote tmp paths
-    image_name = os.path.basename(client_path)
-
-    # tempfile.mkdtemp() guarantees a unique local directory per call, so
-    # local_tmp_path never collides across concurrent flashes. The node
-    # side has no such directory of its own, so reuse the same unique
-    # suffix to keep node_tmp_path collision-free when the same image name
-    # is flashed to the same node concurrently.
-    tmpdir = tempfile.mkdtemp(prefix="dut-flash-")
     unique_suffix = Path(tmpdir).name
-    local_tmp_path = str(Path(tmpdir) / image_name)
-    node_tmp_path = f"/tmp/{unique_suffix}-{image_name}"
+    node_tmp_path = f"/tmp/{unique_suffix}-{os.path.basename(local_image)}"
     node_bmap_path = None
 
     try:
-        # 1) scp from client -> local temp dir
-        if not _run_scp(_remote_spec(client_ssh, client_path), local_tmp_path,
-                        int(client_ssh.get("port", 22))):
-            raise RuntimeError("scp from client failed")
-
-        # 2) scp from local temp dir -> node temp dir
-        if not _run_scp(local_tmp_path, _remote_spec(node_ssh, node_tmp_path),
-                        int(node_ssh.get("port", 22))):
+        if not _push_to_node(node, local_image, node_tmp_path):
             raise RuntimeError("scp to node failed")
 
-        # 2b) Bring the .bmap along when the image has one: bmaptool then
-        #     copies only the mapped blocks, which is much faster and
-        #     checksums the copied data against the bmap.
-        node_bmap_path = _stage_optional_bmap(
-            client, node, client_path, tmpdir, unique_suffix)
+        # With a bmap, bmaptool copies only the mapped blocks, which is
+        # much faster, and checksums them while writing. Best effort:
+        # without it the flash falls back to --nobmap.
+        if local_bmap:
+            staged = (f"/tmp/{unique_suffix}-"
+                      f"{os.path.basename(local_bmap)}")
+            if _push_to_node(node, local_bmap, staged):
+                node_bmap_path = staged
+            else:
+                # A failed push can still leave a partial copy behind
+                _run_node_command(node, f"rm -f {shlex.quote(staged)}")
 
-        # 3) ssh to node: flash, verify device content, hand back to DUT.
-        #    A failure here points at a bad card/mux on this DUT, so take
-        #    it out of rotation; an operator can re-enable it via
-        #    /conf/dut/enabled or a config reload.
+        # A failure on the node points at a bad card/mux on this DUT, so
+        # take it out of rotation; an operator can re-enable it via
+        # /conf/dut/enabled or a config reload.
         try:
             _flash_and_verify_on_node(
                 node, control, device, node_tmp_path, node_bmap_path)
@@ -1393,28 +1381,107 @@ def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
             node, tmpdir, (node_tmp_path, node_bmap_path))
 
 
+def _flash_image(node: dict, dut: dict, client: dict, client_path: str):
+    """
+    Flash an image the client names: fetch it off the client by scp,
+    then hand it to the node.
+
+    Requires passwordless SSH/SCP from the service host to both client
+    and node. A client that cannot be reached that way uploads instead;
+    see _flash_upload.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="dut-flash-")
+    local_image = str(Path(tmpdir) / os.path.basename(client_path))
+
+    client_ssh = client["ssh"]
+    if not _run_scp(_remote_spec(client_ssh, client_path), local_image,
+                    int(client_ssh.get("port", 22))):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("scp from client failed")
+
+    _push_and_flash(node, dut, tmpdir, local_image,
+                    _fetch_optional_bmap(client, client_path, tmpdir))
+
+
+def _save_upload(upload, tmpdir: str) -> str:
+    """
+    Stream an uploaded file into the staging directory.
+
+    The name comes from the request, so it is reduced to a bare
+    filename before it is joined to a path.
+    """
+    name = Path(upload.filename or "").name
+    # Path keeps ".." as a name of its own, and joining that would put
+    # the file outside the staging directory.
+    if not name or name in (".", ".."):
+        raise RuntimeError("uploaded file has no usable name")
+
+    path = str(Path(tmpdir) / name)
+    upload.save(path)
+    return path
+
+
+def _flash_upload(node: dict, dut: dict, image, bmap):
+    """
+    Flash an image the client sent with the request.
+
+    Nothing connects back to the client, so this works from a container,
+    from behind NAT, and from anywhere the service could not reach by
+    SSH.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="dut-flash-")
+    try:
+        local_image = _save_upload(image, tmpdir)
+        local_bmap = _save_upload(bmap, tmpdir) if bmap else None
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+    _push_and_flash(node, dut, tmpdir, local_image, local_bmap)
+
+
 @server.route("/flash", methods=["POST", "PUT"])
 @validate_token
 def flash():
-    body = request.get_json(silent=True) or {}
-    token = body.get("token")
-    path = body.get("path")
-
-    if not path:
-        return jsonify({"status": -99, "error": "path missing"}), 200
-
-    reserve_entry = _get_reserve_by_token(token)
-
-    client = _get_client_by_key(reserve_entry["client-key"])
-    if client is None:
-        return jsonify({"status": -99, "error": "client not found"}), 200
+    reserve_entry = _get_reserve_by_token(_request_token())
 
     node, dut = _get_dut_and_node_by_name(reserve_entry["dut-name"])
     if not node or not dut:
         return jsonify({"status": -99, "error": "dut not found"}), 200
 
-    # /flash reaches the client by SSH on its own, and a NATed client may
-    # have moved since it reserved, so it can re-announce its address here.
+    # Two ways in. An uploaded image needs nothing of the client but the
+    # request itself; a named one has the service fetch it back by scp,
+    # which asks the client to be reachable.
+    upload = request.files.get("image")
+    if upload is not None:
+        return _flash_uploaded(node, dut, upload)
+
+    return _flash_named(node, dut, reserve_entry)
+
+
+def _flash_uploaded(node: dict, dut: dict, upload):
+    try:
+        _flash_upload(node, dut, upload, request.files.get("bmap"))
+    except Exception as e:
+        return jsonify({"status": -99, "error": str(e)}), 200
+
+    return jsonify({"status": 0}), 200
+
+
+def _flash_named(node: dict, dut: dict, reserve_entry: dict):
+    body = request.get_json(silent=True) or {}
+    path = body.get("path")
+
+    if not path:
+        return jsonify({"status": -99, "error": "path missing"}), 200
+
+    client = _get_client_by_key(reserve_entry["client-key"])
+    if client is None:
+        return jsonify({"status": -99, "error": "client not found"}), 200
+
+    # This mode reaches the client by SSH on its own, and a NATed client
+    # may have moved since it reserved, so it can re-announce its
+    # address here.
     try:
         _apply_client_ssh_overrides(client, body)
     except ValueError as e:
@@ -1426,6 +1493,14 @@ def flash():
         return jsonify({"status": -99, "error": str(e)}), 200
 
     return jsonify({"status": 0}), 200
+
+
+@server.errorhandler(413)
+def _upload_too_large(_):
+    limit = server.config.get("MAX_CONTENT_LENGTH") or MAX_UPLOAD_BYTES
+    return jsonify(
+        {"status": -99,
+         "error": f"upload is larger than the {limit} byte limit"}), 200
 
 
 # ---------------------------------------------------------------------------
