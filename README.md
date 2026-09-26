@@ -50,12 +50,7 @@ Configuration is provided as YAML files under a configuration directory (see bel
 
 ### Python dependencies
 
-From `pyproject.toml` / `requirements.txt`:
-
-- `flask>=2.3`
-- `pyyaml>=6.0`
-- `requests>=2.31`
-- For testing: `pytest>=8.0`
+The client and admin CLIs need only `requests>=2.31`, which is what a plain install brings. The service needs `flask>=2.3` and `pyyaml>=6.0` on top, which come from the `server` extra, so a machine that only drives DUTs does not install a web framework it never starts. For testing: `pytest>=8.0`, which pulls the server extra along.
 
 ## Installation
 
@@ -69,7 +64,13 @@ source .venv/bin/activate
 pip install .
 ```
 
-To install with test extras:
+That installs the three console scripts, but only the dependencies the client and admin CLIs use. To run the service, ask for the `server` extra:
+
+```bash
+pip install ".[server]"
+```
+
+Starting `dut-control` without it fails on a missing `flask`. To install with test extras, which include the server:
 
 ```bash
 pip install ".[test]"

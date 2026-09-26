@@ -1,4 +1,3 @@
-flask>=2.3
-pyyaml>=6.0
-pytest>=8.0
-requests>=2.31
+# Everything the package can need, for a development checkout.
+# pyproject.toml is what decides; this only points at it.
+-e .[server,test]
