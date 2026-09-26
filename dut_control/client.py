@@ -25,6 +25,9 @@ _HOSTNAME_LABEL = re.compile(
 # clear on their own; every other status is a mistake that will not.
 BUSY_STATUS = -4
 
+# What /dut/status can report, from least to most reachable.
+REACHABILITY = ("offline", "ping", "ssh")
+
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smh]?)$", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
@@ -310,25 +313,57 @@ def cmd_flash(args: argparse.Namespace) -> None:
         print("flash: ok")
 
 
-def cmd_status(args: argparse.Namespace) -> None:
-    base_url = args.url
-    payload = {"token": _required_token(args)}
-
+def _dut_status(args: argparse.Namespace, token: str) -> str:
+    """One of offline, ping or ssh, as /dut/status reports it."""
     resp = requests.post(
-        _full_url(base_url, "/dut/status"),
-        json=payload,
+        _full_url(args.url, "/dut/status"),
+        json={"token": token},
         timeout=args.timeout,
     )
     resp.raise_for_status()
     data = resp.json()
 
-    # /dut/status returns {"status": "offline"|"ping"|"ssh"}
-    status = data.get("status")
-    if status is None:
+    state = data.get("status")
+    if state is None:
         print("error: unexpected response:", data, file=sys.stderr)
         sys.exit(1)
+    return state
 
-    print(status)
+
+def cmd_status(args: argparse.Namespace) -> None:
+    print(_dut_status(args, _required_token(args)))
+
+
+def _reached(state: str, wanted: str) -> bool:
+    """A DUT answering SSH answers ping too, so the states are a ladder."""
+    if state not in REACHABILITY or wanted not in REACHABILITY:
+        return False
+    return REACHABILITY.index(state) >= REACHABILITY.index(wanted)
+
+
+def cmd_wait(args: argparse.Namespace) -> None:
+    token = _required_token(args)
+
+    for attempt in range(args.retries + 1):
+        state = _dut_status(args, token)
+        if _reached(state, args.wanted):
+            print(state)
+            return
+
+        if attempt == args.retries:
+            break
+        print(
+            f"dut is {state}, waiting {args.retries_wait:g}s for "
+            f"{args.wanted}",
+            file=sys.stderr,
+        )
+        time.sleep(args.retries_wait)
+
+    print(
+        f"error: gave up waiting for {args.wanted}; dut is {state}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -474,6 +509,39 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Reservation token (default: ${TOKEN_ENV})",
     )
     sp_status.set_defaults(func=cmd_status)
+
+    # wait
+    sp_wait = sub.add_parser(
+        "wait",
+        help="Wait for a DUT to become reachable",
+    )
+    sp_wait.add_argument(
+        "token",
+        nargs="?",
+        help=f"Reservation token (default: ${TOKEN_ENV})",
+    )
+    sp_wait.add_argument(
+        "--for",
+        dest="wanted",
+        choices=["ping", "ssh"],
+        default="ssh",
+        help="Reachability to wait for (default: %(default)s)",
+    )
+    # Unlike reserve, waiting no times at all is just status.
+    sp_wait.add_argument(
+        "--retries",
+        type=int,
+        default=30,
+        help="Extra attempts before giving up (default: %(default)s)",
+    )
+    sp_wait.add_argument(
+        "--retries-wait",
+        type=_duration,
+        default="10s",
+        help="Wait between attempts, e.g. 30, 30s, 5m, 1h "
+             "(default: %(default)s)",
+    )
+    sp_wait.set_defaults(func=cmd_wait)
 
     return p
 

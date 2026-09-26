@@ -515,6 +515,9 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 - **`status [token]`**
   Calls `/dut/status` for the given token, or `DUT_CONTROL_TOKEN`, and prints one of `offline`, `ping`, or `ssh`
 
+- **`wait [token] [--for ping|ssh] [--retries N] [--retries-wait D]`**
+  Polls `/dut/status` until the DUT is at least as reachable as `--for` asks, then prints the state it reached. Gives up after the retries with status 1. Progress goes to stderr. Unlike `reserve`, this one retries by default.
+
 **Example usage**:
 
 ```bash
@@ -549,6 +552,10 @@ dut-control-client flash /images/rpi5-image.wic
 
 # Check DUT status
 dut-control-client status
+
+# Wait for it to finish booting after a power on
+dut-control-client power on
+dut-control-client wait --for ssh --retries 30 --retries-wait 10s
 
 # Hand this reservation back
 dut-control-client lease
