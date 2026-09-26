@@ -449,3 +449,59 @@ def test_a_timeout_that_was_asked_for_wins(answers, command):
     client_mod.main(command)
 
     assert calls[0][2] == 5.0
+
+
+def test_flash_names_the_image_by_default(answers):
+    calls = answers(OK)
+
+    client_mod.main(["flash", "a-token", "/images/rpi5.wic"])
+
+    assert calls[0][1]["path"] == "/images/rpi5.wic"
+
+
+def test_flash_upload_sends_the_file_instead(monkeypatch, tmp_path):
+    """Nothing has to reach this host back, so nothing is named."""
+    image = tmp_path / "rpi5.wic.bz2"
+    image.write_bytes(b"an image")
+    sent = {}
+
+    def post(url, data=None, files=None, timeout=None, json=None):
+        sent["data"] = data
+        sent["files"] = {name: (n, h.read())
+                         for name, (n, h) in (files or {}).items()}
+        return FakeResponse(OK)
+
+    monkeypatch.setattr(client_mod.requests, "post", post)
+    monkeypatch.setenv(client_mod.CLIENT_KEY_ENV, "a-client-key")
+
+    client_mod.main(["flash", "a-token", str(image), "--upload"])
+
+    assert sent["data"] == {"token": "a-token"}
+    assert sent["files"]["image"] == ("rpi5.wic.bz2", b"an image")
+    assert "bmap" not in sent["files"]
+
+
+def test_flash_upload_takes_the_bmap_beside_the_image(monkeypatch, tmp_path):
+    image = tmp_path / "rpi5.wic.bz2"
+    image.write_bytes(b"an image")
+    (tmp_path / "rpi5.wic.bmap").write_bytes(b"<bmap/>")
+    sent = {}
+
+    def post(url, data=None, files=None, timeout=None, json=None):
+        sent["files"] = {name: n for name, (n, _) in (files or {}).items()}
+        return FakeResponse(OK)
+
+    monkeypatch.setattr(client_mod.requests, "post", post)
+
+    client_mod.main(["flash", "a-token", str(image), "--upload"])
+
+    assert sent["files"]["bmap"] == "rpi5.wic.bmap"
+
+
+def test_flash_upload_of_something_that_is_not_a_file(capsys, tmp_path):
+    with pytest.raises(SystemExit) as exit_info:
+        client_mod.main(["flash", "a-token", str(tmp_path / "gone"),
+                         "--upload"])
+
+    assert exit_info.value.code == 1
+    assert "is not a file" in capsys.readouterr().err
