@@ -2224,3 +2224,34 @@ def test_wipe_needs_a_dut_with_storage(monkeypatch):
 
     with pytest.raises(RuntimeError, match="storage.control/device missing"):
         server_mod._wipe_storage(node, dut, server_mod._MIB)
+
+
+def test_the_card_goes_back_to_the_dut_after_a_failed_flash(monkeypatch):
+    """Otherwise a bad image leaves the mux on host and the DUT dark."""
+    node = {"name": "node-flash-back", "ssh": {"ip": "192.0.2.20"}}
+    commands = []
+
+    def fake_run(n, cmd):
+        commands.append(cmd)
+        return cmd.endswith(" dut")
+
+    monkeypatch.setattr(server_mod, "_run_node_command", fake_run)
+
+    with pytest.raises(RuntimeError, match="flash command failed on node"):
+        server_mod._flash_and_verify_on_node(
+            node, "/dev/sg1", "/dev/sda1", "/tmp/image.wic")
+
+    assert commands[-1] == "usbsdmux /dev/sg1 dut"
+    # No point reading the device back when nothing was written to it.
+    assert len(commands) == 2
+
+
+def test_a_failed_flash_and_a_stuck_mux_report_the_mux(monkeypatch):
+    node = {"name": "node-flash-stuck", "ssh": {"ip": "192.0.2.20"}}
+    monkeypatch.setattr(server_mod, "_run_node_command",
+                        lambda n, cmd: False)
+
+    with pytest.raises(RuntimeError,
+                       match="switch storage back to dut.*flash also failed"):
+        server_mod._flash_and_verify_on_node(
+            node, "/dev/sg1", "/dev/sda1", "/tmp/image.wic")
