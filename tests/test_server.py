@@ -5,6 +5,7 @@ import threading
 
 import dut_control.server as server_mod
 import pytest
+import io
 import time
 import sys
 from pathlib import Path
@@ -2255,3 +2256,116 @@ def test_a_failed_flash_and_a_stuck_mux_report_the_mux(monkeypatch):
                        match="switch storage back to dut.*flash also failed"):
         server_mod._flash_and_verify_on_node(
             node, "/dev/sg1", "/dev/sda1", "/tmp/image.wic")
+
+
+# ---------------------------------------------------------------------------
+# /flash, upload mode
+# ---------------------------------------------------------------------------
+
+def test_an_uploaded_image_is_flashed_without_touching_the_client(
+        flask_client, monkeypatch):
+    """Nothing connects back, which is the whole point of uploading."""
+    _, dut, token = _reserved_dut(token="token-upload")
+    staged = {}
+
+    def fake_push(node, dut_arg, tmpdir, local_image, local_bmap=None):
+        staged["image"] = Path(local_image).read_bytes()
+        staged["bmap"] = local_bmap
+
+    monkeypatch.setattr(server_mod, "_push_and_flash", fake_push)
+    monkeypatch.setattr(server_mod, "_run_scp",
+                        lambda *a: pytest.fail("nothing should be fetched"))
+
+    resp = flask_client.post(
+        "/flash",
+        data={"token": token, "image": (io.BytesIO(b"an image"), "rpi5.wic")},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.get_json()["status"] == 0
+    assert staged["image"] == b"an image"
+    assert staged["bmap"] is None
+
+
+def test_an_uploaded_bmap_travels_with_its_image(flask_client, monkeypatch):
+    """The service cannot go looking for it the way the path mode does."""
+    _, _, token = _reserved_dut(token="token-upload-bmap")
+    staged = {}
+
+    monkeypatch.setattr(
+        server_mod, "_push_and_flash",
+        lambda n, d, t, image, bmap=None: staged.update(bmap=bmap))
+
+    flask_client.post(
+        "/flash",
+        data={
+            "token": token,
+            "image": (io.BytesIO(b"an image"), "rpi5.wic.bz2"),
+            "bmap": (io.BytesIO(b"<bmap/>"), "rpi5.wic.bmap"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert Path(staged["bmap"]).name == "rpi5.wic.bmap"
+
+
+def test_an_upload_names_its_own_file_but_not_its_own_path(monkeypatch,
+                                                           tmp_path):
+    """The name comes from the request, so it cannot carry a path."""
+    class Upload:
+        filename = "../../etc/passwd"
+
+        def save(self, path):
+            Path(path).write_bytes(b"x")
+
+    saved = server_mod._save_upload(Upload(), str(tmp_path))
+
+    assert Path(saved).parent == tmp_path
+    assert Path(saved).name == "passwd"
+
+
+@pytest.mark.parametrize("filename", ["../..", "..", ".", "", None, "/"])
+def test_an_upload_with_no_usable_name_is_refused(tmp_path, filename):
+    class Upload:
+        def save(self, path):
+            pytest.fail("should not have been saved")
+
+    upload = Upload()
+    upload.filename = filename
+
+    with pytest.raises(RuntimeError, match="no usable name"):
+        server_mod._save_upload(upload, str(tmp_path))
+
+
+def test_the_path_mode_still_works(flask_client, monkeypatch):
+    """Other consumers name the image; uploading is a second way in."""
+    _, _, token = _reserved_dut(token="token-path-mode")
+    called = {}
+
+    monkeypatch.setattr(
+        server_mod, "_flash_image",
+        lambda node, dut, client, path: called.update(path=path))
+
+    resp = flask_client.post(
+        "/flash", json={"token": token, "path": "/images/rpi5.wic"})
+
+    assert resp.get_json()["status"] == 0
+    assert called["path"] == "/images/rpi5.wic"
+
+
+def test_an_upload_over_the_limit_is_a_status_not_an_http_error(
+        flask_client, monkeypatch):
+    _, _, token = _reserved_dut(token="token-upload-big")
+    monkeypatch.setitem(server_mod.server.config, "MAX_CONTENT_LENGTH", 8)
+
+    resp = flask_client.post(
+        "/flash",
+        data={"token": token,
+              "image": (io.BytesIO(b"far too many bytes"), "rpi5.wic")},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == -99
+    assert "larger than" in data["error"]
