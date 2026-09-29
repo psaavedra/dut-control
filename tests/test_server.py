@@ -2427,3 +2427,148 @@ def test_load_clients_rejects_a_malformed_allowed_pools(tmp_path,
 
     with pytest.raises(ValueError, match="allowed-pools"):
         server_mod._load_clients(tmp_path)
+
+
+def _restricted_client(allowed_pools, key="client-key-01"):
+    return dict(_make_client(key=key), **{"allowed-pools": allowed_pools})
+
+
+def _record_tunnels(monkeypatch):
+    """Track a reserve's tunnel in processes instead of spawning ssh."""
+    def fake_start_ssh_tunnel(client, dut, port, token):
+        entry = {"pid": 12345, "reserve-token": token,
+                 "client-name": client["name"], "ports-in-use": [port],
+                 "process": None}
+        with server_mod.state_lock:
+            server_mod.processes.append(entry)
+        return entry
+
+    monkeypatch.setattr(server_mod, "_start_ssh_tunnel", fake_start_ssh_tunnel)
+
+
+def _two_pool_node():
+    return {
+        "name": "node-01",
+        "ssh": {"ip": "192.0.2.20", "port": 22, "user": "runner"},
+        "duts": [_make_pool_dut("rpi5-01", "rpi5"),
+                 _make_pool_dut("rpi4-01", "rpi4")],
+    }
+
+
+def test_pools_lists_only_the_allowed_pools(flask_client):
+    client = _restricted_client(["rpi5"])
+    node = _two_pool_node()
+    node["duts"].append(_make_pool_dut("rpi5-02", "rpi5"))
+    now = int(time.time())
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+        server_mod.reserves.append(
+            {"token": "t1", "valid-from": now - 10, "valid-until": now + 600,
+             "client-key": client["key"], "dut-name": "rpi5-01"})
+
+    resp = flask_client.post("/pools", json={"client-key": client["key"]})
+    assert resp.get_json() == {
+        "status": 0,
+        "pools": [{"name": "rpi5", "enabled-duts": 2, "free-duts": 1}],
+    }
+
+
+def test_pools_is_empty_for_an_empty_allowlist(flask_client):
+    client = _restricted_client([])
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [_two_pool_node()]
+
+    resp = flask_client.post("/pools", json={"client-key": client["key"]})
+    assert resp.get_json() == {"status": 0, "pools": []}
+
+
+def test_pools_hides_the_forbidden_pools_of_a_multipool_dut(flask_client):
+    client = _restricted_client(["rpi5"])
+    node, dut = _make_node_dut()
+    # The allowed pool goes second. Reading only the first shows none
+    dut["metadata"] = {"pools": ["rpi5-fast", "rpi5"]}
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    resp = flask_client.post("/pools", json={"client-key": client["key"]})
+    assert resp.get_json()["pools"] == [
+        {"name": "rpi5", "enabled-duts": 1, "free-duts": 1}]
+
+
+def test_two_clients_see_their_own_pools(flask_client):
+    first = _restricted_client(["rpi5"], key="client-key-01")
+    second = _restricted_client(["rpi4"], key="client-key-02")
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [first, second]
+        server_mod.nodes[:] = [_two_pool_node()]
+
+    for client, expected in ((first, "rpi5"), (second, "rpi4")):
+        resp = flask_client.post("/pools", json={"client-key": client["key"]})
+        assert [p["name"] for p in resp.get_json()["pools"]] == [expected]
+
+
+def test_reserve_accepts_an_allowed_pool(flask_client, monkeypatch):
+    client = _restricted_client(["pool-01"])
+    node, dut = _make_node_dut(pool="pool-01")
+    _record_tunnels(monkeypatch)
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    resp = flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": "pool-01"})
+    assert resp.get_json()["status"] == 0
+    assert len(server_mod.processes) == 1
+
+
+def test_reserve_rejects_a_pool_outside_the_allowlist(flask_client,
+                                                      monkeypatch):
+    """/reserve takes the pool name from the request, so hiding the
+    pool in /pools is not enough. /reserve has to refuse it too."""
+    client = _restricted_client(["pool-02"])
+    node, _ = _make_node_dut(pool="pool-01")
+    _record_tunnels(monkeypatch)
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    resp = flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": "pool-01"})
+
+    assert resp.get_json() == {
+        "status": -2, "error": "pool is not accessible to client"}
+    assert server_mod.reserves == []
+    assert server_mod.processes == []
+
+
+def test_a_reservation_outlives_its_pool_policy(flask_client, monkeypatch):
+    """A pool dropped from the policy stops new reservations. The
+    reservation already given out can still be released, tunnel and
+    all."""
+    client = _restricted_client(["pool-01"])
+    node, _ = _make_node_dut(pool="pool-01")
+    _record_tunnels(monkeypatch)
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    body = {"client-key": client["key"], "pool": "pool-01"}
+    assert flask_client.post("/reserve", json=body).get_json()["status"] == 0
+
+    # The same state as a /conf/reload that drops the pool
+    with server_mod.state_lock:
+        server_mod.clients[:] = [_restricted_client([])]
+
+    assert flask_client.post("/reserve", json=body).get_json()["status"] == -2
+    assert flask_client.post("/lease", json=body).get_json() == {"status": 0}
+    assert server_mod.processes == []
+    assert server_mod.reserves[0]["valid-until"] <= int(time.time())
