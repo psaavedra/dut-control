@@ -211,6 +211,18 @@ def _normalize_metadata(value):
     return metadata
 
 
+def _normalize_allowed_pools(value) -> list[str]:
+    """
+    Check a client's ``allowed-pools`` list and drop repeated names.
+
+    A bad entry raises instead of being skipped. This list says who can
+    reach what, so a name dropped in silence would change the rules.
+    """
+    if not isinstance(value, list) or not all(map(_is_pool_name, value)):
+        raise ValueError("client allowed-pools must be a list of pool names")
+    return list(dict.fromkeys(str(v) for v in value))
+
+
 def _load_yaml_file(path: Path):
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -295,6 +307,11 @@ def _load_clients(config_dir: Path):
                 "ssh": _normalize_section(doc.get("ssh", {})),
                 "ports-range": _normalize_section(doc.get("ports-range", {})),
             }
+            # Only set it when the YAML has the key. No key means
+            # every pool. An empty list means no pool at all.
+            if "allowed-pools" in doc:
+                client["allowed-pools"] = _normalize_allowed_pools(
+                    doc["allowed-pools"])
             result.append(client)
 
     return result
@@ -329,6 +346,18 @@ def _get_client_by_key(key: str):
             if c.get("key") == key:
                 return c
     return None
+
+
+def _client_can_access_pool(client, pool: str) -> bool:
+    """
+    Tell if a client can see and reserve from a pool.
+
+    A client with no ``allowed-pools`` key gets every pool, so the old
+    configurations keep working. A client of None gets every pool too,
+    for the callers that list pools without a request.
+    """
+    allowed = (client or {}).get("allowed-pools")
+    return allowed is None or pool in allowed
 
 
 def _dut_enabled(dut: dict) -> bool:
