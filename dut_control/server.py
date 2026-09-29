@@ -94,6 +94,13 @@ def validate_pool(func):
         if not pool:
             return jsonify({"status": -2, "error": "pool missing"}), 200
 
+        # Hiding a pool in /pools is not enough. /reserve takes any
+        # name from the request, so it has to check here too.
+        # validate_client must wrap this decorator to set request.client.
+        if not _client_can_access_pool(request.client, pool):
+            return jsonify({"status": -2,
+                            "error": "pool is not accessible to client"}), 200
+
         # Pool existence
         if not _pool_exists(pool):
             return jsonify({"status": -2, "error": "pool does not exist"}), 200
@@ -413,12 +420,13 @@ def _reserved_dut_names(now: int):
                 if r.get("valid-until", 0) >= now}
 
 
-def _list_pools():
+def _list_pools(client=None):
     """
     Per-pool summary: how many DUTs are enabled and how many of those
     are not currently reserved. Only pools with at least one enabled
     DUT are listed, which is exactly what _pool_exists considers to
-    exist and therefore what /reserve can hand out.
+    exist and therefore what /reserve can hand out. With a client,
+    only the pools that client is allowed to use are listed.
     """
     pools = {}
     with state_lock:
@@ -429,14 +437,17 @@ def _list_pools():
         reserved = _reserved_dut_names(_now_epoch())
         for node in nodes:
             for dut in node.get("duts", []):
-                pool = dut.get("metadata", {}).get("pool")
-                if not pool or not _dut_enabled(dut):
+                if not _dut_enabled(dut):
                     continue
-                entry = pools.setdefault(
-                    pool, {"name": pool, "enabled-duts": 0, "free-duts": 0})
-                entry["enabled-duts"] += 1
-                if dut.get("name") not in reserved:
-                    entry["free-duts"] += 1
+                for pool in _dut_pools(dut):
+                    if not _client_can_access_pool(client, pool):
+                        continue
+                    entry = pools.setdefault(
+                        pool,
+                        {"name": pool, "enabled-duts": 0, "free-duts": 0})
+                    entry["enabled-duts"] += 1
+                    if dut.get("name") not in reserved:
+                        entry["free-duts"] += 1
     return [pools[name] for name in sorted(pools)]
 
 
@@ -850,7 +861,7 @@ def _rollback_reserve(token: str):
 @validate_client
 def pools():
     """List reservable pools with their enabled and free DUT counts."""
-    return jsonify({"status": 0, "pools": _list_pools()}), 200
+    return jsonify({"status": 0, "pools": _list_pools(request.client)}), 200
 
 
 @server.route("/reserve", methods=["POST", "PUT"])
