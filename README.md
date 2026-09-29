@@ -130,6 +130,26 @@ Example:
 
 `ssh` and `ports-range` sections are normalized by the service into dictionaries.
 
+An optional `allowed-pools` list restricts which pools a client can list and reserve from:
+
+```yaml
+- name: client-02
+  key: 6b0c1e4f2a7d9b83
+  ssh:
+    - ip: 192.168.1.247
+    - port: 22
+    - user: ci
+  ports-range:
+    - from: 5100
+    - to: 5110
+  allowed-pools:
+    - rpi5-fast
+```
+
+A client without the key, like `client-01` above, reaches every pool, so configurations written before the key keep working; `allowed-pools: []` denies every pool. The value must be a YAML list of pool names, and a scalar, a mapping, an empty entry or a bare `yes` (which YAML reads as a boolean) makes the configuration fail to load rather than quietly changing who can reach what. Repeated names are dropped. A name is not checked against the configured pools, since a pool may be added, removed or disabled later without making the policy invalid; a permitted pool that does not exist simply never shows up.
+
+The policy covers discovery and new reservations only: a reservation already handed out survives a `/conf/reload` that drops its pool, so its token can still be used and released. `/conf/info/clients` reports `allowed-pools` for the clients that have one.
+
 `ssh.ip` and `ssh.port` are the address the service uses to reach the client back (reverse tunnel and image `scp`). A client that is not reachable at that address, typically because it sits behind NAT and only knows its public address and forwarded port at run time, can announce the right values on each request; see [Client SSH overrides](#client-ssh-overrides). Such a client still needs an `ssh` section in its YAML entry, if only for `user`; the announced values replace the configured ones in memory.
 
 ### Node and DUT configuration
@@ -275,7 +295,7 @@ List the pools a client can reserve from, with their DUT counts.
 }
 ```
 
-`enabled-duts` counts the DUTs in the pool that are enabled; `free-duts` counts those of them without an unexpired reservation, so it is what `/reserve` could currently hand out. Pools are sorted by name, and a pool whose DUTs are all disabled is omitted, since it cannot be reserved from at all.
+`enabled-duts` counts the DUTs in the pool that are enabled; `free-duts` counts those of them without an unexpired reservation, so it is what `/reserve` could currently hand out. A DUT in several pools is counted in each of them. Pools are sorted by name, and a pool whose DUTs are all disabled is omitted, since it cannot be reserved from at all. The listing is limited to the pools the client is allowed to use, so a client whose `allowed-pools` is empty gets `{"status": 0, "pools": []}`; see [Client configuration](#client-configuration).
 
 Missing or invalid `client-key` returns `status = -1`; an invalid SSH override returns `status = -5` (see [Client SSH overrides](#client-ssh-overrides)).
 
@@ -316,7 +336,7 @@ On success, the service:
 **Error responses** use HTTP 200 with a JSON body containing `status` and `error`:
 
 - `status = -1`: missing or invalid `client-key`
-- `status = -2`: missing `pool` or pool does not exist
+- `status = -2`: missing `pool`, pool not in the client's `allowed-pools`, or pool does not exist
 - `status = -3`: pool exists but is empty
 - `status = -4`: all DUTs in pool already reserved or no free ports for client
 - `status = -5`: invalid `client-ssh-ip` or `client-ssh-port`
@@ -501,7 +521,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   Returns the current in-memory list of nodes and DUTs
 
 - **`POST /conf/info/clients`**
-  Returns the current in-memory list of clients
+  Returns the current in-memory list of clients, which is where the effective `allowed-pools` policy of each one can be read
 
 - **`POST /conf/info/processes`**
   Returns tracked SSH tunnel processes (pid, reserve token, command, client name, ports in use)
