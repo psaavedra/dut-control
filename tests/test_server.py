@@ -2369,3 +2369,61 @@ def test_an_upload_over_the_limit_is_a_status_not_an_http_error(
     data = resp.get_json()
     assert data["status"] == -99
     assert "larger than" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# Per-client allowed pools
+# ---------------------------------------------------------------------------
+
+def _write_client_yaml(clients_dir, allowed_pools_lines=""):
+    clients_dir.mkdir(exist_ok=True)
+    (clients_dir / "client-01.yml").write_text(
+        f"""
+- name: client-01
+  key: client-key-01
+  ssh:
+    - ip: 192.0.2.10
+  ports-range:
+    - from: 5000
+    - to: 5005
+{allowed_pools_lines}
+"""
+    )
+
+
+def test_load_clients_leaves_allowed_pools_out_when_not_configured(tmp_path):
+    _write_client_yaml(tmp_path / "clients")
+
+    assert "allowed-pools" not in server_mod._load_clients(tmp_path)[0]
+
+
+def test_load_clients_keeps_allowed_pools_order_and_dedups(tmp_path):
+    _write_client_yaml(tmp_path / "clients", """  allowed-pools:
+    - rpi5-fast
+    - rpi5
+    - rpi5-fast""")
+
+    loaded = server_mod._load_clients(tmp_path)
+    assert loaded[0]["allowed-pools"] == ["rpi5-fast", "rpi5"]
+
+
+def test_load_clients_keeps_an_empty_allowed_pools_list(tmp_path):
+    """An empty list is a policy of its own, not a missing key."""
+    _write_client_yaml(tmp_path / "clients", "  allowed-pools: []")
+
+    assert server_mod._load_clients(tmp_path)[0]["allowed-pools"] == []
+
+
+# One case per guard. An empty key is a value that is not a list,
+# and it is the typo that looks like "no policy". A bare yes is a list
+# item that is not a name: YAML turns it into a boolean.
+@pytest.mark.parametrize("declaration", [
+    "  allowed-pools:",
+    "  allowed-pools:\n    - rpi5\n    - yes",
+])
+def test_load_clients_rejects_a_malformed_allowed_pools(tmp_path,
+                                                        declaration):
+    _write_client_yaml(tmp_path / "clients", declaration)
+
+    with pytest.raises(ValueError, match="allowed-pools"):
+        server_mod._load_clients(tmp_path)
