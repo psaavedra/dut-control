@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}dut-control admin{% endblock %}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; margin: 0;
+           background: Canvas; color: CanvasText; }
+    header { display: flex; align-items: baseline; gap: 1rem;
+             flex-wrap: wrap; padding: .75rem 1rem;
+             border-bottom: 1px solid #8884; }
+    header h1 { font-size: 1rem; margin: 0; }
+    header .target { color: #8888; font-size: .8rem; }
+    nav { display: flex; gap: .75rem; flex-wrap: wrap; }
+    nav a { text-decoration: none; }
+    nav a.on { font-weight: 600; text-decoration: underline; }
+    main { padding: 1rem; }
+    .msgs { list-style: none; margin: 0 0 1rem; padding: 0; }
+    .msgs li { padding: .5rem .75rem; margin-bottom: .25rem;
+               border-left: 3px solid #8888; }
+    .msgs li.error { border-color: #c33; }
+    .msgs li.ok { border-color: #2a2; }
+    table { border-collapse: collapse; width: 100%;
+            font-size: .9rem; }
+    th, td { text-align: left; padding: .35rem .6rem;
+             border-bottom: 1px solid #8883; vertical-align: top; }
+    th { font-weight: 600; }
+    code { font-family: ui-monospace, monospace; font-size: .85em; }
+    .menu { list-style: none; padding: 0; max-width: 32rem; }
+    .menu li { border-bottom: 1px solid #8883; padding: .6rem 0; }
+    .menu a { font-weight: 600; }
+    .menu p { margin: .2rem 0 0; color: #8888; font-size: .85rem; }
+    .muted { color: #8888; }
+    td.wrap { word-break: break-all; max-width: 28rem; }
+    button { font: inherit; padding: .25rem .6rem; }
+    form.inline { display: inline-block; margin: 0 .4rem .4rem 0; }
+    .note { color: #8888; font-size: .85rem; max-width: 44rem; }
+    .badge { font-size: .75rem; padding: .1rem .4rem;
+             border: 1px solid #8886; border-radius: .2rem; }
+    .badge.ok { border-color: #2a2; }
+    .badge.off { border-color: #c33; }
+  </style>
+</head>
+<body>
+{% if logged_in %}
+<header>
+  <h1>dut-control admin</h1>
+  <span class="target">{{ base_url }}</span>
+  {% block nav %}
+  <nav>
+    <a href="{{ url_for('dashboard') }}">menu</a>
+    <a href="{{ url_for('nodes') }}">nodes</a>
+    <a href="{{ url_for('clients') }}">clients</a>
+    <a href="{{ url_for('processes') }}">processes</a>
+    <a href="{{ url_for('reserves') }}">reserves</a>
+  </nav>
+  {% endblock %}
+  <form method="post" action="{{ url_for('logout') }}"
+        style="margin-left:auto">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <button type="submit">log out</button>
+  </form>
+</header>
+{% endif %}
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <ul class="msgs">
+      {% for category, message in messages %}
+      <li class="{{ category }}">{{ message }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

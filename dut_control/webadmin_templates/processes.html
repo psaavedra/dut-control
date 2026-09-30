@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}processes - dut-control admin{% endblock %}
+{% block content %}
+<h2>ssh tunnel processes</h2>
+{% if not processes %}
+<p class="muted">no tunnel processes tracked</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>pid</th><th>client</th><th>ports in use</th>
+      <th>reserve token</th><th>command</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for proc in processes %}
+    <tr>
+      <td><code>{{ proc['pid'] }}</code></td>
+      <td>{{ proc['client-name'] or '-' }}</td>
+      <td>
+        {%- for port in proc['ports-in-use'] -%}
+          <code>{{ port }}</code>{% if not loop.last %}, {% endif %}
+        {%- endfor -%}
+      </td>
+      <td><code>{{ proc['reserve-token'] }}</code></td>
+      <td class="wrap"><code>{{ proc['command'] }}</code></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="note">
+  One process per active reservation, each holding a reverse tunnel
+  open. Pruning reservations does not stop these; a process still
+  listed for a released reservation is a leak.
+</p>
+{% endif %}
+{% endblock %}

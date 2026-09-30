@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% from "_macros.html" import kv %}
+{% block title %}clients - dut-control admin{% endblock %}
+{% block content %}
+<h2>clients</h2>
+{% if not clients %}
+<p class="muted">no clients configured</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>name</th><th>key</th><th>ssh</th><th>ports range</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for client in clients %}
+    <tr>
+      <td><strong>{{ client['name'] }}</strong></td>
+      <td>
+        <details>
+          <summary><code>{{ client['key'] | mask }}</code></summary>
+          <code>{{ client['key'] }}</code>
+        </details>
+      </td>
+      <td>{{ kv(client['ssh']) }}</td>
+      <td>
+        {%- set span = client['ports-range'] -%}
+        {%- if span.get('from') is not none -%}
+          <code>{{ span.get('from') }}-{{ span.get('to') }}</code>
+        {%- else -%}
+          <span class="muted">none</span>
+        {%- endif -%}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="note">
+  A client key is enough to reserve DUTs, so it is masked until you
+  expand it. Expanding reveals it in this page only.
+</p>
+{% endif %}
+{% endblock %}

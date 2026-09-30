@@ -1,0 +1,34 @@
+{# Render an open-ended mapping, so YAML keys the service passes
+   through are never silently dropped by the UI. #}
+{% macro kv(mapping) %}
+{%- if mapping %}
+  {%- for key, value in mapping.items() %}
+<div><span class="muted">{{ key }}:</span> <code>{{ value }}</code></div>
+  {%- endfor %}
+{%- else %}<span class="muted">none</span>
+{%- endif %}
+{% endmacro %}
+
+{% macro badge(text, kind) %}
+<span class="badge {{ kind }}">{{ text }}</span>
+{%- endmacro %}
+
+{# A POST form for a mutating action. The CSRF token is passed in so no
+   caller can forget it and get a 400 at runtime. #}
+{% macro action_form(endpoint, label, token, fields={}) %}
+<form method="post" action="{{ url_for(endpoint) }}" class="inline">
+  <input type="hidden" name="csrf" value="{{ token }}">
+  {%- for name, value in fields.items() %}
+  <input type="hidden" name="{{ name }}" value="{{ value }}">
+  {%- endfor %}
+  <button type="submit">{{ label }}</button>
+</form>
+{%- endmacro %}
+
+{# A count that may be unavailable, so one failed call greys out one
+   number rather than blanking the page. #}
+{% macro num(value) %}
+{%- if value is none -%}<span class="muted">n/a</span>
+{%- else -%}<strong>{{ value }}</strong>
+{%- endif -%}
+{% endmacro %}
