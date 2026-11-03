@@ -46,6 +46,7 @@ _SSH_SKIP_HOST_CHECK = [
 CONFIG_DIR = Path(os.environ.get("DUT_CONTROL_DIR", "dut-control"))
 
 admin_key = None
+accounting_conf = {}  # see _normalize_accounting()
 nodes = []       # list[dict]
 clients = []     # list[dict]
 reserves = []    # list[dict]
@@ -230,6 +231,166 @@ def _normalize_allowed_pools(value) -> list[str]:
     return list(dict.fromkeys(str(v) for v in value))
 
 
+# ---------------------------------------------------------------------------
+# Accounting and quota configuration
+# ---------------------------------------------------------------------------
+#
+# A bad value raises instead of falling back to a default: these keys
+# decide what a team may spend, so a typo must not change it in silence.
+
+_ENFORCEMENT_MODES = ("observe", "warn", "reject")
+
+_ACCOUNTING_DEFAULTS = {
+    "enabled": False,
+    "enforcement": "observe",
+    "token-minutes": 120,
+    "default-monthly-token-limit": 40,
+    "default-weekly-recharge-tokens": 10,
+    "recharge-weekday": 1,
+    "recharge-hour-utc": 0,
+    "pool-costs": {},
+}
+_ACCOUNTING_KEYS = {*_ACCOUNTING_DEFAULTS, "default-balance-cap", "database"}
+
+_QUOTA_TOKENS = ("monthly-token-limit", "weekly-recharge-tokens",
+                 "balance-cap")
+_QUOTA_KEYS = {*_QUOTA_TOKENS, "enabled", "max-active-reservations",
+               "pool-concurrency", "reserve-rate"}
+
+
+def _check_known_keys(section: dict, known: set, what: str):
+    unknown = sorted(str(k) for k in section if k not in known)
+    if unknown:
+        raise ValueError(f"{what} has unknown keys: {', '.join(unknown)}")
+
+
+def _config_bool(value, what: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{what} must be true or false")
+    return value
+
+
+def _config_number(value, what: str, integer=False, positive=False):
+    """A number of tokens, minutes and the like; never a boolean."""
+    kinds = (int,) if integer else (int, float)
+    ok = isinstance(value, kinds) and not isinstance(value, bool)
+    if not ok or value < 0 or (positive and value == 0):
+        sign = "positive" if positive else "non-negative"
+        kind = "integer" if integer else "number"
+        raise ValueError(f"{what} must be a {sign} {kind}")
+    return value
+
+
+def _config_int_between(value, what: str, low: int, high: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) \
+            or not low <= value <= high:
+        raise ValueError(f"{what} must be an integer from {low} to {high}")
+    return value
+
+
+def _config_name(value, what: str) -> str:
+    """Same rule as a pool name: a non-empty string or number."""
+    if not _is_pool_name(value):
+        raise ValueError(f"{what} must be a name")
+    return str(value)
+
+
+def _config_per_pool(value, what: str, integer=False) -> dict:
+    """A mapping of pool name to a positive number."""
+    section = _normalize_section(value)
+    if not isinstance(value, (dict, list)):
+        raise ValueError(f"{what} must map pool names to numbers")
+    return {_config_name(k, f"{what} key"):
+            _config_number(v, f"{what} {k}", integer, positive=True)
+            for k, v in section.items()}
+
+
+def _state_dir(config_dir: Path) -> Path:
+    return Path(os.environ.get("DUT_CONTROL_STATE_DIR", config_dir))
+
+
+def _normalize_accounting(value, config_dir: Path) -> dict:
+    """
+    Check the ``accounting`` section of conf.yml and fill in defaults.
+
+    No section, or ``enabled: false``, keeps accounting off.
+    """
+    section = dict(_normalize_section(value))
+    _check_known_keys(section, _ACCOUNTING_KEYS, "accounting")
+    acc = {**_ACCOUNTING_DEFAULTS, **section}
+
+    acc["enabled"] = _config_bool(acc["enabled"], "accounting enabled")
+    if acc["enforcement"] not in _ENFORCEMENT_MODES:
+        raise ValueError("accounting enforcement must be one of "
+                         + ", ".join(_ENFORCEMENT_MODES))
+    acc["token-minutes"] = _config_number(
+        acc["token-minutes"], "accounting token-minutes",
+        integer=True, positive=True)
+    acc.setdefault("default-balance-cap", acc["default-monthly-token-limit"])
+    for key in ("default-monthly-token-limit",
+                "default-weekly-recharge-tokens", "default-balance-cap"):
+        acc[key] = _config_number(acc[key], f"accounting {key}")
+    acc["recharge-weekday"] = _config_int_between(
+        acc["recharge-weekday"], "accounting recharge-weekday", 1, 7)
+    acc["recharge-hour-utc"] = _config_int_between(
+        acc["recharge-hour-utc"], "accounting recharge-hour-utc", 0, 23)
+    acc["pool-costs"] = _config_per_pool(
+        acc["pool-costs"], "accounting pool-costs")
+    acc["database"] = str(acc.get("database")
+                          or _state_dir(config_dir) / "accounting.sqlite3")
+    return acc
+
+
+def _normalize_reserve_rate(value) -> dict:
+    rate = dict(_normalize_section(value))
+    _check_known_keys(rate, {"requests", "window-seconds"},
+                      "quota reserve-rate")
+    return {key: _config_number(rate.get(key), f"quota reserve-rate {key}",
+                                integer=True, positive=True)
+            for key in ("requests", "window-seconds")}
+
+
+def _normalize_quota(value) -> dict:
+    """
+    Check a client's ``quota`` section.
+
+    Only the keys the YAML has are kept; the rest come from the
+    defaults in conf.yml when they are used.
+    """
+    quota = dict(_normalize_section(value))
+    _check_known_keys(quota, _QUOTA_KEYS, "client quota")
+    quota["enabled"] = _config_bool(quota.get("enabled", True),
+                                    "quota enabled")
+    for key in _QUOTA_TOKENS:
+        if key in quota:
+            quota[key] = _config_number(quota[key], f"quota {key}")
+    if "max-active-reservations" in quota:
+        quota["max-active-reservations"] = _config_number(
+            quota["max-active-reservations"],
+            "quota max-active-reservations", integer=True, positive=True)
+    if "pool-concurrency" in quota:
+        quota["pool-concurrency"] = _config_per_pool(
+            quota["pool-concurrency"], "quota pool-concurrency",
+            integer=True)
+    if "reserve-rate" in quota:
+        quota["reserve-rate"] = _normalize_reserve_rate(quota["reserve-rate"])
+    return quota
+
+
+def _check_shared_accounts(clients: list):
+    """
+    Clients may share an account, e.g. an old and a new key during a
+    rotation, but then they must agree on its quota.
+    """
+    quotas = {}
+    for client in clients:
+        account = client.get("account-id", client["name"])
+        quota = quotas.setdefault(account, client.get("quota"))
+        if quota != client.get("quota"):
+            raise ValueError(
+                f"clients of account {account} have different quotas")
+
+
 def _load_yaml_file(path: Path):
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -250,6 +411,8 @@ def _load_conf(config_dir: Path):
 
     if not data.get("admin-key"):
         raise ValueError("conf.yml must contain 'admin-key'")
+    data["accounting"] = _normalize_accounting(
+        data.get("accounting", {}), config_dir)
     return data
 
 
@@ -319,17 +482,24 @@ def _load_clients(config_dir: Path):
             if "allowed-pools" in doc:
                 client["allowed-pools"] = _normalize_allowed_pools(
                     doc["allowed-pools"])
+            # Same rule: set only when the YAML has the key.
+            if "account-id" in doc:
+                client["account-id"] = _config_name(
+                    doc["account-id"], "client account-id")
+            if "quota" in doc:
+                client["quota"] = _normalize_quota(doc["quota"])
             result.append(client)
 
+    _check_shared_accounts(result)
     return result
 
 
 def reload_config():
     """
-    Reload admin_key, nodes, clients from YAML.
+    Reload admin_key, accounting_conf, nodes, clients from YAML.
     Does NOT touch reserves/processes.
     """
-    global admin_key
+    global admin_key, accounting_conf
 
     conf = _load_conf(CONFIG_DIR)
     new_nodes = _load_nodes(CONFIG_DIR)
@@ -337,6 +507,7 @@ def reload_config():
 
     with state_lock:
         admin_key = conf["admin-key"]
+        accounting_conf = conf["accounting"]
         server.config["MAX_CONTENT_LENGTH"] = int(
             conf.get("max-upload-bytes", MAX_UPLOAD_BYTES))
         nodes[:] = new_nodes
