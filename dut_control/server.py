@@ -872,38 +872,37 @@ def reserve():
     duts_in_pool = request.duts_in_pool
     now = _now_epoch()
 
-    # Early check: any available DUTs?
-    in_use_duts = _reserved_dut_names(now)
-    available = [(node, dut) for (node, dut) in duts_in_pool
-                 if dut["name"] not in in_use_duts]
-    if not available:
-        return _error_response(-4, "all duts in use already")
-
-    node, dut = random.choice(available)
-
-    # Early check: free port?
-    free_port = _find_free_port_for_client(request.client)
-    if free_port is None:
-        return _error_response(-4, "no free ports for client")
-
-    # Create and store reservation
-    token = secrets.token_hex(8)
-    reserve_entry = {
-        "token": token,
-        "valid-from": now,
-        "valid-until": now + 2 * 3600,  # 2 hours
-        "client-key": request.client["key"],
-        "dut-name": dut["name"],
-    }
+    # One lock over the whole claim: the DUT, the port and the tunnel
+    # entry that marks the port as used. Two calls at the same time
+    # could pick the same DUT or port otherwise. Popen does not wait
+    # for ssh to connect, so the lock is held only for a short time.
     with state_lock:
-        reserves.append(reserve_entry)
+        in_use_duts = _reserved_dut_names(now)
+        available = [(node, dut) for (node, dut) in duts_in_pool
+                     if dut["name"] not in in_use_duts]
+        if not available:
+            return _error_response(-4, "all duts in use already")
 
-    # Start tunnel or rollback
-    try:
-        _start_ssh_tunnel(request.client, dut, free_port, token)
-    except Exception as e:
-        _rollback_reserve(token)
-        return _error_response(-99, f"internal error: {e}")
+        node, dut = random.choice(available)
+
+        free_port = _find_free_port_for_client(request.client)
+        if free_port is None:
+            return _error_response(-4, "no free ports for client")
+
+        token = secrets.token_hex(8)
+        reserves.append({
+            "token": token,
+            "valid-from": now,
+            "valid-until": now + 2 * 3600,  # 2 hours
+            "client-key": request.client["key"],
+            "dut-name": dut["name"],
+        })
+
+        try:
+            _start_ssh_tunnel(request.client, dut, free_port, token)
+        except Exception as e:
+            _rollback_reserve(token)
+            return _error_response(-99, f"internal error: {e}")
 
     return jsonify({
         "status": 0,
