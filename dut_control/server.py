@@ -1280,6 +1280,113 @@ def lease():
 
 
 # ---------------------------------------------------------------------------
+# /account and /account/history
+# ---------------------------------------------------------------------------
+
+HISTORY_LIMIT = 100
+HISTORY_MAX_LIMIT = 1000
+
+
+def _account_active_reservations(account: str, now: int) -> int:
+    """Unexpired reservations of every client of the account."""
+    with state_lock:
+        keys = {c["key"] for c in clients if _account_id(c) == account}
+        return sum(1 for r in reserves
+                   if r.get("client-key") in keys
+                   and r.get("valid-until", 0) >= now)
+
+
+def _account_summary(store, client: dict, now: int) -> dict:
+    """Settle the account of the client and say where it stands."""
+    policy = _account_policy(client)
+    state = store.settle(_account_id(client), policy, now)
+    tokens = accounting.to_tokens
+    return {
+        "account-id": state["account-id"],
+        "tokens-available": tokens(state["balance"]),
+        "monthly-token-limit": tokens(policy.monthly_limit),
+        "weekly-recharge-tokens": tokens(policy.weekly_recharge),
+        "balance-cap": tokens(policy.balance_cap),
+        "period-start": state["period-start"],
+        "period-end": state["period-end"],
+        "period-granted": tokens(state["period-granted"]),
+        "next-recharge-at": state["next-recharge-at"],
+        "next-recharge-at-iso": accounting.iso(state["next-recharge-at"]),
+        "next-recharge-tokens": tokens(state["next-recharge"]),
+        "active-reservations": _account_active_reservations(
+            state["account-id"], now),
+    }
+
+
+def _history_filters(body: dict) -> dict:
+    """The filters of /account/history; ValueError for a bad one."""
+    filters = {key: _config_number(body[key], key, integer=True)
+               for key in ("since", "until", "before", "limit")
+               if body.get(key) is not None}
+    filters.update({key: str(body[key]) for key in ("kind", "pool")
+                    if body.get(key) is not None})
+    filters["limit"] = min(filters.get("limit", HISTORY_LIMIT),
+                           HISTORY_MAX_LIMIT)
+    return filters
+
+
+def _history_entry(row: dict) -> dict:
+    """A ledger row without the hash of the reservation token."""
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "ts-iso": accounting.iso(row["ts"]),
+        "kind": row["kind"],
+        "tokens": accounting.to_tokens(row["amount_millitokens"]),
+        "balance-after": accounting.to_tokens(
+            row["balance_after_millitokens"]),
+        "pool": row["pool"],
+        "dut-name": row["dut_name"],
+        "minutes": row["minutes"],
+        "actor": row["actor"],
+        "reason": row["reason"],
+    }
+
+
+@server.route("/account", methods=["POST", "PUT"])
+@validate_client
+def account():
+    """The balance of the client's account and its next recharge."""
+    store = accounting_store
+    if store is None:
+        return _error_response(-10, "accounting is off")
+    summary = _account_summary(store, request.client, _now_epoch())
+    return jsonify({"status": 0, **summary}), 200
+
+
+@server.route("/account/history", methods=["POST", "PUT"])
+@validate_client
+def account_history():
+    """
+    Ledger entries of the client's account, newest first. A full page
+    gives ``next-before``, to pass as ``before`` for the next one.
+    """
+    store = accounting_store
+    if store is None:
+        return _error_response(-10, "accounting is off")
+    body = request.get_json(silent=True) or {}
+    try:
+        filters = _history_filters(body)
+    except ValueError as e:
+        return _error_response(-99, str(e))
+
+    # Settle first, so recharges that are due show up.
+    account_id = _account_summary(
+        store, request.client, _now_epoch())["account-id"]
+    entries = [_history_entry(r)
+               for r in store.history(account_id, **filters)]
+    full = entries and len(entries) == filters["limit"]
+    return jsonify({"status": 0, "account-id": account_id,
+                    "entries": entries,
+                    "next-before": entries[-1]["id"] if full else None}), 200
+
+
+# ---------------------------------------------------------------------------
 # /power/<on|off|cycle>
 # ---------------------------------------------------------------------------
 
