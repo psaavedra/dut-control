@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import concurrent.futures
+import json
 import threading
 
 import dut_control.server as server_mod
@@ -3162,3 +3163,83 @@ def test_admin_report_adds_up_the_ledger(flask_client, monkeypatch,
     assert [(r["kind"], r["entries"], r["tokens"], r["minutes"])
             for r in data["rows"] if r["kind"] == "charge"] == \
         [("charge", 2, -4.0, 240)]
+
+
+# ---------------------------------------------------------------------------
+# Audit of power, flash and wipe
+# ---------------------------------------------------------------------------
+
+def _activity(store):
+    """Every activity row, oldest first, as dicts."""
+    conn = store._connect()
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM activity_events ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def test_power_is_logged_with_the_pool_of_the_charge(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client, "rpi4")["token"]
+    monkeypatch.setattr(server_mod, "_power_action_error", lambda *a: None)
+
+    flask_client.post("/power/cycle", json={"token": token})
+
+    [row] = _activity(accounting_on)
+    assert (row["account_id"], row["action"], row["pool"], row["dut_name"],
+            row["result"]) == ("client-01", "power", "rpi4", "dut-01",
+                               "success")
+    assert json.loads(row["metadata_json"]) == {"action": "cycle"}
+
+
+def test_flash_logs_both_modes_alike_and_no_path_or_token(
+        flask_client, monkeypatch, accounting_on):
+    _, _, token = _reserved_dut(token="token-audit-flash")
+    monkeypatch.setattr(server_mod, "_flash_image", lambda *a: None)
+    monkeypatch.setattr(server_mod, "_push_and_flash", lambda *a: None)
+
+    flask_client.post("/flash", json={"token": token,
+                                      "path": "/home/me/secret/rpi5.wic"})
+    flask_client.post(
+        "/flash",
+        data={"token": token, "image": (io.BytesIO(b"x"), "rpi5.wic")},
+        content_type="multipart/form-data")
+
+    rows = _activity(accounting_on)
+    assert [json.loads(r["metadata_json"]) for r in rows] == [
+        {"mode": "named", "image-name": "rpi5.wic"},
+        {"mode": "upload", "image-name": "rpi5.wic", "bmap": False}]
+    assert {r["result"] for r in rows} == {"success"}
+    assert {tuple(r) for r in rows} == {tuple(rows[0])}
+    stored = json.dumps(rows)
+    assert token not in stored and "secret" not in stored
+
+
+def test_wipe_logs_a_failure_without_its_path(flask_client, monkeypatch,
+                                              accounting_on):
+    _, _, token = _reserved_dut(token="token-audit-wipe")
+
+    def fake_wipe(node, dut, size_bytes):
+        raise OSError("[Errno 2] No such file: '/var/tmp/x'")
+
+    monkeypatch.setattr(server_mod, "_wipe_storage", fake_wipe)
+
+    flask_client.post("/wipe", json={"token": token, "size": 1024})
+
+    [row] = _activity(accounting_on)
+    assert (row["action"], row["result"], row["error"]) == (
+        "wipe", "failed", "[Errno 2] No such file")
+    assert json.loads(row["metadata_json"]) == {"size-bytes": 1024}
+
+
+def test_dut_status_is_not_logged(flask_client, monkeypatch, accounting_on):
+    _, _, token = _reserved_dut(token="token-audit-status")
+    monkeypatch.setattr(server_mod, "_ping_host", lambda *a, **k: True)
+    monkeypatch.setattr(server_mod, "_check_ssh", lambda *a, **k: True)
+
+    flask_client.post("/dut/status", json={"token": token})
+
+    assert _activity(accounting_on) == []
