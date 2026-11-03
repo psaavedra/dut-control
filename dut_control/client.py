@@ -171,6 +171,14 @@ def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
     status = data.get("status")
     err = data.get("error", "unknown error")
     print(f"{prefix}: {err} (status={status})", file=sys.stderr)
+    # What a quota refusal says about when it clears.
+    if "tokens-required" in data:
+        print(f"needs {data['tokens-required']:g} tokens, has "
+              f"{data['tokens-available']:g}; next recharge of "
+              f"{data['next-recharge-tokens']:g} at "
+              f"{data['next-recharge-at-iso']}", file=sys.stderr)
+    if "retry-after" in data:
+        print(f"retry after {data['retry-after']}s", file=sys.stderr)
     sys.exit(1)
 
 
