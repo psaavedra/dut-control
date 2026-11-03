@@ -51,6 +51,7 @@ CONFIG_DIR = Path(os.environ.get("DUT_CONTROL_DIR", "dut-control"))
 admin_key = None
 accounting_conf = {}  # see _normalize_accounting()
 accounting_store = None  # an AccountingStore when accounting is on
+reserve_attempts = {}  # account-id -> epochs of recent /reserve calls
 nodes = []       # list[dict]
 clients = []     # list[dict]
 reserves = []    # list[dict]
@@ -1081,8 +1082,12 @@ def _reservation_price(pool: str) -> int:
 
 def _charge_reserve(client: dict, pool: str, dut: dict, token: str,
                     now: int):
-    """Charge a new reservation. Nothing is refused yet: the balance
-    may go below zero."""
+    """
+    Charge a new reservation. The quota gate has already refused what
+    it had to under the same lock, so the charge itself never fails for
+    lack of tokens: in observe and warn modes the balance may go below
+    zero.
+    """
     if accounting_store is None:
         return None
     return accounting_store.charge(
@@ -1092,16 +1097,130 @@ def _charge_reserve(client: dict, pool: str, dut: dict, token: str,
         allow_negative=True)
 
 
-def _accounting_fields(client: dict, charge, valid_until: int) -> dict:
+def _accounting_fields(client: dict, charge, valid_until: int,
+                       warnings: list) -> dict:
     """What /reserve adds to its answer; nothing with accounting off."""
     if charge is None:
         return {}
-    return {
+    fields = {
         "account-id": _account_id(client),
         "charged-tokens": accounting.to_tokens(charge["charged"]),
         "tokens-available": accounting.to_tokens(charge["balance"]),
         "valid-until": valid_until,
     }
+    if warnings:
+        fields["quota-warning"] = warnings
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# Quota gate of /reserve
+# ---------------------------------------------------------------------------
+
+class _QuotaProblem:
+    """A quota rule a reservation would break, as /reserve reports it."""
+
+    def __init__(self, status: int, code: str, error: str, **details):
+        self.status, self.code = status, code
+        self.body = {"status": status, "error": error, "error-code": code,
+                     **details}
+
+    def response(self):
+        return jsonify(self.body), 200
+
+
+def _enforcement_mode(client: dict) -> str:
+    """The global mode, but observe for an account with no quota."""
+    if not client.get("quota", {}).get("enabled", True):
+        return "observe"
+    return accounting_conf["enforcement"]
+
+
+def _rate_problem(client: dict, account: str, now: int):
+    """
+    Too many /reserve calls in the window of ``reserve-rate``. A call
+    over the limit is not counted, so a client that waits gets through.
+    """
+    rate = client.get("quota", {}).get("reserve-rate")
+    if rate is None:
+        return None
+    window = rate["window-seconds"]
+    recent = [t for t in reserve_attempts.get(account, [])
+              if t > now - window]
+    reserve_attempts[account] = recent
+    if len(recent) >= rate["requests"]:
+        return _QuotaProblem(-9, "rate_limited", "too many reserve calls",
+                             **{"retry-after": recent[0] + window - now})
+    recent.append(now)
+    return None
+
+
+def _account_reservations_in(account: str, pool: str, now: int) -> int:
+    """Unexpired reservations of the account on DUTs of the pool."""
+    with state_lock:
+        keys = {c["key"] for c in clients if _account_id(c) == account}
+        names = {r["dut-name"] for r in reserves
+                 if r.get("client-key") in keys
+                 and r.get("valid-until", 0) >= now}
+    return sum(1 for name in names
+               if _dut_in_pool(_get_dut_and_node_by_name(name)[1] or {},
+                               pool))
+
+
+def _concurrency_problem(client: dict, account: str, pool: str, now: int):
+    """Too many reservations held at once, in all or in this pool."""
+    quota = client.get("quota", {})
+    limit = quota.get("max-active-reservations")
+    if limit is not None and \
+            _account_active_reservations(account, now) >= limit:
+        return _QuotaProblem(-8, "concurrency_limit",
+                             "too many active reservations",
+                             **{"max-active-reservations": limit})
+    limit = quota.get("pool-concurrency", {}).get(pool)
+    if limit is not None and \
+            _account_reservations_in(account, pool, now) >= limit:
+        return _QuotaProblem(-8, "concurrency_limit",
+                             "too many active reservations in pool",
+                             **{"pool-concurrency": limit})
+    return None
+
+
+def _balance_problem(store, client: dict, account: str, pool: str,
+                     now: int):
+    """The balance does not cover one reservation in the pool."""
+    state = store.settle(account, _account_policy(client), now)
+    price = _reservation_price(pool)
+    if state["balance"] >= price:
+        return None
+    tokens = accounting.to_tokens
+    return _QuotaProblem(-6, "quota_exceeded", "quota exceeded", **{
+        "tokens-required": tokens(price),
+        "tokens-available": tokens(state["balance"]),
+        "next-recharge-at": state["next-recharge-at"],
+        "next-recharge-at-iso": accounting.iso(state["next-recharge-at"]),
+        "next-recharge-tokens": tokens(state["next-recharge"]),
+    })
+
+
+def _quota_gate(client: dict, pool: str, now: int):
+    """
+    Check a reservation against the quota of the client's account.
+    Returns the response to refuse it with, or None, and the warnings
+    to add to its answer. Call it under state_lock, so the checks and
+    the charge see the same state.
+    """
+    store = accounting_store
+    if store is None:
+        return None, []
+    account = _account_id(client)
+    problems = [p for p in (
+        _rate_problem(client, account, now),
+        _concurrency_problem(client, account, pool, now),
+        _balance_problem(store, client, account, pool, now)) if p]
+    mode = _enforcement_mode(client)
+    if problems and mode == "reject":
+        return problems[0].response(), []
+    return None, [p.code for p in problems] if mode == "warn" else []
 
 
 def _undo_reserve(token: str, now: int):
@@ -1164,6 +1283,10 @@ def reserve():
     # could pick the same DUT or port otherwise. Popen does not wait
     # for ssh to connect, so the lock is held only for a short time.
     with state_lock:
+        refusal, warnings = _quota_gate(request.client, request.pool, now)
+        if refusal is not None:
+            return refusal
+
         in_use_duts = _reserved_dut_names(now)
         available = [(node, dut) for (node, dut) in duts_in_pool
                      if dut["name"] not in in_use_duts]
@@ -1202,7 +1325,8 @@ def reserve():
         "ssh-port": dut["network"]["ssh-port"],
         "tunnel-ssh-port": free_port,
         "client-ssh-overrides": request.client.get("ssh-overrides", []),
-        **_accounting_fields(request.client, charge, valid_until),
+        **_accounting_fields(request.client, charge, valid_until,
+                             warnings),
     }), 200
 
 
