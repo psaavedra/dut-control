@@ -2930,3 +2930,18 @@ def test_account_history_rejects_a_bad_filter(flask_client, accounting_on):
 
     assert data["status"] == -99
     assert "since" in data["error"]
+
+
+def test_pools_shows_the_price_of_each_pool(flask_client, accounting_on):
+    client = _one_shared_dut_setup()
+    server_mod.accounting_conf["pool-costs"]["rpi4"] = 12
+
+    data = flask_client.post(
+        "/pools", json={"client-key": client["key"]}).get_json()
+
+    # A new account holds 10 tokens: rpi5 at 2 fits, rpi4 at 12 does not.
+    assert [(p["name"], p["token-cost"], p["reservation-tokens"],
+             p["affordable"]) for p in data["pools"]] == [
+        ("rpi4", 12, 12.0, False), ("rpi5", 2, 2.0, True)]
+    assert data["pools"][0]["reservation-minutes"] == 120
+    assert data["pools"][0]["free-duts"] == 1
