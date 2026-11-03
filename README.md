@@ -397,6 +397,19 @@ On success, the service:
 
 `client-ssh-overrides` echoes back the SSH fields of the client that are currently overridden, and is an empty list for a client using its configured address.
 
+With [accounting](#accounting) on, the reservation is charged to the account of the client and the answer has four more keys:
+
+```json
+{
+  "account-id": "team-browser",
+  "charged-tokens": 2.0,
+  "tokens-available": 8.0,
+  "valid-until": 1790623200
+}
+```
+
+The price is set by the pool in the request, not by the other pools of the DUT, so a DUT in a cheap pool and an expensive pool costs the price of the pool in the request. For now a reservation is never refused for lack of tokens: the balance can go below zero. If the SSH tunnel does not start, the reservation is dropped and the whole charge goes back.
+
 **Error responses** use HTTP 200 with a JSON body containing `status` and `error`:
 
 - `status = -1`: missing or invalid `client-key`
@@ -404,7 +417,7 @@ On success, the service:
 - `status = -3`: pool exists but is empty
 - `status = -4`: all DUTs in pool already reserved or no free ports for client
 - `status = -5`: invalid `client-ssh-ip` or `client-ssh-port`
-- `status = -99`: internal error when starting the SSH tunnel
+- `status = -99`: internal error when starting the SSH tunnel or charging the reservation
 
 ### Lease / release: /lease
 
@@ -424,6 +437,9 @@ On success the service:
 
 - Kills SSH tunnel processes associated with the selected reservations
 - Sets `valid-until` to now for those reservations
+- With [accounting](#accounting) on, gives back the unused whole minutes of each one; a started minute counts as used
+
+A reservation gets one refund at most, however many times it is released. The refund can take the balance over the cap, since these are the account's own tokens, and it does not count toward the monthly limit. A reservation that runs to its end, or one removed by `/conf/reserves/prune`, gets nothing back.
 
 **Success response**:
 
