@@ -433,15 +433,27 @@ class AccountingStore:
         the last row of the previous page. Rows are written in time
         order, so the id order is the time order.
         """
-        filters = {"ts >= ?": since, "ts < ?": until, "kind = ?": kind,
-                   "pool = ?": pool, "id < ?": before}
-        where = ["account_id = ?"] + [k for k, v in filters.items()
-                                      if v is not None]
-        args = [account] + [v for v in filters.values() if v is not None]
+        return self._page("ledger", {
+            "account_id = ?": account, "ts >= ?": since, "ts < ?": until,
+            "kind = ?": kind, "pool = ?": pool, "id < ?": before}, limit)
+
+    def activity(self, *, account: str = None, since: int = None,
+                 until: int = None, action: str = None, pool: str = None,
+                 before: int = None, limit: int = 100) -> list:
+        """Activity rows, of every account or of one, newest first, paged
+        as history() is."""
+        return self._page("activity_events", {
+            "account_id = ?": account, "ts >= ?": since, "ts < ?": until,
+            "action = ?": action, "pool = ?": pool, "id < ?": before}, limit)
+
+    def _page(self, table: str, filters: dict, limit: int) -> list:
+        """Rows of ``table`` that match the filters that are set."""
+        where = [k for k, v in filters.items() if v is not None] or ["1"]
+        args = [v for v in filters.values() if v is not None]
         conn = self._connect()
         try:
             rows = conn.execute(
-                f"SELECT * FROM ledger WHERE {' AND '.join(where)} "
+                f"SELECT * FROM {table} WHERE {' AND '.join(where)} "
                 "ORDER BY id DESC LIMIT ?", (*args, limit))
             return [dict(r) for r in rows]
         finally:
