@@ -424,7 +424,32 @@ With [accounting](#accounting) on, the reservation is charged to the account of 
 }
 ```
 
-The price is set by the pool in the request, not by the other pools of the DUT, so a DUT in a cheap pool and an expensive pool costs the price of the pool in the request. For now a reservation is never refused for lack of tokens: the balance can go below zero. If the SSH tunnel does not start, the reservation is dropped and the whole charge goes back.
+The price is set by the pool in the request, not by the other pools of the DUT, so a DUT in a cheap pool and an expensive pool costs the price of the pool in the request. If the SSH tunnel does not start, the reservation is dropped and the whole charge goes back.
+
+Before it picks a DUT, `/reserve` checks the quota of the account, in this order: the `reserve-rate` of the client, its `max-active-reservations` and `pool-concurrency`, then the balance against the price. What happens when a check fails depends on `enforcement`:
+
+| `enforcement` | Result |
+|---|---|
+| `observe` | The reservation goes through; the balance can go below zero. |
+| `warn` | The same, and the answer lists the failed checks: `"quota-warning": ["quota_exceeded"]`. |
+| `reject` | The reservation is refused with the first failed check, and nothing is charged. |
+
+An account with `quota.enabled: false` is always in `observe`. `pool-concurrency` counts the reservations of the account on the DUTs of the pool, so a DUT reserved through another pool it belongs to counts too. A `/reserve` call counts toward `reserve-rate` whatever its result, except a call refused for the rate itself, so a client that waits gets through.
+
+A refusal carries an `error-code` for scripts. For lack of tokens it also says when that clears:
+
+```json
+{
+  "status": -6,
+  "error": "quota exceeded",
+  "error-code": "quota_exceeded",
+  "tokens-required": 3.0,
+  "tokens-available": 1.5,
+  "next-recharge-at": 1790640000,
+  "next-recharge-at-iso": "2026-09-29T00:00:00Z",
+  "next-recharge-tokens": 10.0
+}
+```
 
 **Error responses** use HTTP 200 with a JSON body containing `status` and `error`:
 
@@ -433,6 +458,9 @@ The price is set by the pool in the request, not by the other pools of the DUT, 
 - `status = -3`: pool exists but is empty
 - `status = -4`: all DUTs in pool already reserved or no free ports for client
 - `status = -5`: invalid `client-ssh-ip` or `client-ssh-port`
+- `status = -6`, `error-code = quota_exceeded`: the balance does not cover the reservation; wait for `next-recharge-at` or an admin credit
+- `status = -8`, `error-code = concurrency_limit`: the account holds as many reservations as `max-active-reservations`, or as `pool-concurrency` allows in the pool; release one first
+- `status = -9`, `error-code = rate_limited`: too many `/reserve` calls; `retry-after` says in how many seconds to try again
 - `status = -99`: internal error when starting the SSH tunnel or charging the reservation
 
 ### Lease / release: /lease
@@ -745,7 +773,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   ```
 
 - **`reserve <pool> [--json] [--retries N] [--retries-wait D]`**
-  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change. `--retries` waits out a pool whose DUTs are all taken (`status = -4`). `--retries-wait` is a number of seconds, or carries an `s`, `m` or `h` suffix.
+  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change. `--retries` waits out a pool whose DUTs are all taken (`status = -4`), but not a quota refusal (`-6`, `-8`, `-9`), which no short wait clears; for one of those it prints when the refusal clears (the next recharge, or `retry-after`) on stderr. `--retries-wait` is a number of seconds, or carries an `s`, `m` or `h` suffix.
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
   Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used. Given no filter at all, it releases the reservation named by `DUT_CONTROL_TOKEN` when that is set, and everything the client holds when it is not
