@@ -194,6 +194,10 @@ def cmd_pools(args: argparse.Namespace) -> None:
     if data.get("status") != 0:
         _print_error_and_exit("pools failed", data)
 
+    if args.json:
+        print(json.dumps(data))
+        return
+
     pools = data.get("pools", [])
     width = max([len("POOL")] + [len(p["name"]) for p in pools])
     print(f"{'POOL':<{width}}  ENABLED  FREE")
@@ -566,6 +570,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp_pools = sub.add_parser(
         "pools",
         help="List pools with their enabled and free DUT counts",
+    )
+    sp_pools.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the listing as one JSON object, with the token "
+             "prices when the service has accounting on",
     )
     sp_pools.set_defaults(func=cmd_pools)
 
