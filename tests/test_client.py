@@ -605,3 +605,40 @@ def test_pools_prints_one_json_object(answers, capsys):
     assert client_mod.main(["pools", "--json"]) == 0
 
     assert json.loads(capsys.readouterr().out) == listing
+
+
+QUOTA_EXCEEDED = {
+    "status": -6, "error": "quota exceeded", "error-code": "quota_exceeded",
+    "tokens-required": 3.0, "tokens-available": 1.5,
+    "next-recharge-at": 1790630400,
+    "next-recharge-at-iso": "2026-09-29T00:00:00Z",
+    "next-recharge-tokens": 10.0,
+}
+CONCURRENCY = {"status": -8, "error": "too many active reservations",
+               "error-code": "concurrency_limit"}
+RATE_LIMITED = {"status": -9, "error": "too many reserve calls",
+                "error-code": "rate_limited", "retry-after": 40}
+
+
+@pytest.mark.parametrize("refusal", [QUOTA_EXCEEDED, CONCURRENCY,
+                                     RATE_LIMITED],
+                         ids=["quota", "concurrency", "rate"])
+def test_a_quota_refusal_is_not_waited_out(replies, refusal):
+    calls, waits = replies(refusal, RESERVATION)
+
+    with pytest.raises(SystemExit):
+        client_mod.main(["reserve", "rpi5", "--retries", "5"])
+
+    assert len(calls) == 1
+    assert waits == []
+
+
+def test_a_quota_refusal_says_when_it_clears(replies, capsys):
+    replies(QUOTA_EXCEEDED)
+
+    with pytest.raises(SystemExit):
+        client_mod.main(["reserve", "rpi5"])
+
+    err = capsys.readouterr().err
+    assert "needs 3 tokens, has 1.5" in err
+    assert "next recharge of 10 at 2026-09-29T00:00:00Z" in err
