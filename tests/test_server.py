@@ -2846,3 +2846,87 @@ def test_open_store_keeps_the_store_of_the_same_file(accounting_on,
     assert server_mod._open_store(dict(conf, enabled=False)) is None
     other = dict(conf, database=str(tmp_path / "other.sqlite3"))
     assert server_mod._open_store(other).path == other["database"]
+
+
+# ---------------------------------------------------------------------------
+# /account and /account/history
+# ---------------------------------------------------------------------------
+
+def test_account_says_accounting_is_off(flask_client):
+    client = _one_shared_dut_setup()
+
+    for path in ("/account", "/account/history"):
+        data = flask_client.post(
+            path, json={"client-key": client["key"]}).get_json()
+        assert data == {"status": -10, "error": "accounting is off"}
+
+
+def test_account_reports_the_balance_and_the_next_recharge(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    _reserve_json(flask_client, client)
+
+    data = flask_client.post(
+        "/account", json={"client-key": client["key"]}).get_json()
+
+    assert data["status"] == 0
+    assert data["account-id"] == "client-01"
+    assert data["tokens-available"] == 8.0
+    assert data["monthly-token-limit"] == 40.0
+    assert data["active-reservations"] == 1
+    assert data["next-recharge-at"] > int(time.time())
+    assert data["next-recharge-at-iso"].endswith("Z")
+
+
+def test_account_counts_the_reservations_of_every_client_of_the_account(
+        flask_client, monkeypatch, accounting_on):
+    old = dict(_make_client(), **{"account-id": "team"})
+    new = dict(_make_client(name="client-02", key="client-key-02"),
+               **{"account-id": "team"})
+    node = {"name": "node-01", "ssh": {"ip": "192.0.2.20"},
+            "duts": [_make_pool_dut("dut-01", "rpi5")]}
+    with server_mod.state_lock:
+        server_mod.clients[:] = [old, new]
+        server_mod.nodes[:] = [node]
+    _record_tunnels(monkeypatch)
+    _reserve_json(flask_client, old)
+
+    data = flask_client.post(
+        "/account", json={"client-key": new["key"]}).get_json()
+
+    assert (data["account-id"], data["active-reservations"]) == ("team", 1)
+    assert data["tokens-available"] == 8.0
+
+
+def test_account_history_pages_without_the_token_hash(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client)["token"]
+    flask_client.post(
+        "/lease", json={"client-key": client["key"], "token": token})
+
+    def page(**filters):
+        return flask_client.post(
+            "/account/history",
+            json={"client-key": client["key"], **filters}).get_json()
+
+    first = page(limit=2)
+    assert [e["kind"] for e in first["entries"]] == ["refund", "charge"]
+    assert "reservation_token_hash" not in first["entries"][0]
+    rest = page(limit=2, before=first["next-before"])
+    assert [e["kind"] for e in rest["entries"]] == ["recharge"]
+    assert rest["next-before"] is None
+    assert page(kind="charge")["entries"][0]["pool"] == "rpi5"
+
+
+def test_account_history_rejects_a_bad_filter(flask_client, accounting_on):
+    client = _one_shared_dut_setup()
+
+    data = flask_client.post(
+        "/account/history",
+        json={"client-key": client["key"], "since": "yesterday"}).get_json()
+
+    assert data["status"] == -99
+    assert "since" in data["error"]
