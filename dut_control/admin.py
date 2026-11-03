@@ -159,6 +159,14 @@ def cmd_account_ledger(args: argparse.Namespace) -> None:
     }))
 
 
+def cmd_account_activity(args: argparse.Namespace) -> None:
+    _print_json(_post_account(args, "/conf/account/activity", {
+        "client": args.client, "since": args.since, "until": args.until,
+        "action": args.action, "pool": args.pool, "limit": args.limit,
+        "before": args.before,
+    }))
+
+
 REPORT_COLUMNS = ("account-id", "pool", "kind", "entries", "tokens",
                   "minutes")
 
@@ -230,6 +238,17 @@ def _add_account_parsers(sub) -> None:
     sp.add_argument("--before", type=int,
                     help="Entries older than this id, for the next page")
     sp.set_defaults(func=cmd_account_ledger)
+
+    sp = sub.add_parser("account-activity",
+                        help="List the power, flash and wipe calls logged")
+    _add_time_filters(sp)
+    sp.add_argument("--client", help="Only the account of this client")
+    sp.add_argument("--action", choices=["power", "flash", "wipe"],
+                    help="Only this action")
+    sp.add_argument("--limit", type=int, help="Events per page")
+    sp.add_argument("--before", type=int,
+                    help="Events older than this id, for the next page")
+    sp.set_defaults(func=cmd_account_activity)
 
     sp = sub.add_parser("account-report",
                         help="Totals by account, pool and kind")
