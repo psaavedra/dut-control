@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import ipaddress
+import json
 import os
 import random
 import re
@@ -1461,12 +1462,13 @@ def _account_summary(store, client: dict, now: int) -> dict:
     }
 
 
-def _history_filters(body: dict) -> dict:
-    """The filters of /account/history; ValueError for a bad one."""
+def _history_filters(body: dict, names=("kind", "pool")) -> dict:
+    """The paging filters of /account/history, or of another listing
+    with other ``names`` to match; ValueError for a bad one."""
     filters = {key: _config_number(body[key], key, integer=True)
                for key in ("since", "until", "before", "limit")
                if body.get(key) is not None}
-    filters.update({key: str(body[key]) for key in ("kind", "pool")
+    filters.update({key: str(body[key]) for key in names
                     if body.get(key) is not None})
     filters["limit"] = min(filters.get("limit", HISTORY_LIMIT),
                            HISTORY_MAX_LIMIT)
@@ -1639,6 +1641,55 @@ def conf_account_ledger(store, body):
     return jsonify({"result": 0, **page}), 200
 
 
+def _optional_account(body: dict):
+    """The account of ``client``, or None for every account when it is
+    not given; LookupError for an unknown client."""
+    if body.get("client") is None:
+        return None
+    client = _client_by_name(body["client"])
+    if client is None:
+        raise LookupError("client not found")
+    return _account_id(client)
+
+
+def _activity_event(row: dict) -> dict:
+    """An activity row without the hash of the reservation token."""
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "ts-iso": accounting.iso(row["ts"]),
+        "account-id": row["account_id"],
+        "action": row["action"],
+        "pool": row["pool"],
+        "dut-name": row["dut_name"],
+        "result": row["result"],
+        "error": row["error"],
+        "metadata": json.loads(row["metadata_json"]),
+    }
+
+
+@server.route("/conf/account/activity", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_activity(store, body):
+    """
+    The power, flash and wipe calls logged on reservations, newest
+    first, for one ``client``'s account or for every account, paged
+    as /account/history is.
+    """
+    try:
+        account = _optional_account(body)
+        filters = _history_filters(body, ("action", "pool"))
+    except LookupError as e:
+        return _admin_result(-1, str(e))
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    events = [_activity_event(r)
+              for r in store.activity(account=account, **filters)]
+    full = events and len(events) == filters["limit"]
+    return jsonify({"result": 0, "events": events,
+                    "next-before": events[-1]["id"] if full else None}), 200
+
+
 @server.route("/conf/account/report", methods=["POST", "PUT"])
 @admin_accounting
 def conf_account_report(store, body):
@@ -1646,15 +1697,12 @@ def conf_account_report(store, body):
     Ledger totals by account, pool and kind, between ``since`` and
     ``until``, for one ``client``'s account or ``pool`` if given.
     """
-    account = None
-    if body.get("client") is not None:
-        client = _client_by_name(body["client"])
-        if client is None:
-            return _admin_result(-1, "client not found")
-        account = _account_id(client)
     try:
+        account = _optional_account(body)
         times = {k: _config_number(body[k], k, integer=True)
                  for k in ("since", "until") if body.get(k) is not None}
+    except LookupError as e:
+        return _admin_result(-1, str(e))
     except ValueError as e:
         return _admin_result(-2, str(e))
     rows = store.report(account=account, pool=body.get("pool"), **times)
