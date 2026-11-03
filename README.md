@@ -361,6 +361,22 @@ List the pools a client can reserve from, with their DUT counts.
 
 `enabled-duts` counts the DUTs in the pool that are enabled; `free-duts` counts those of them without an unexpired reservation, so it is what `/reserve` could currently hand out. A DUT in several pools is counted in each of them. Pools are sorted by name, and a pool whose DUTs are all disabled is omitted, since it cannot be reserved from at all. The listing is limited to the pools the client is allowed to use, so a client whose `allowed-pools` is empty gets `{"status": 0, "pools": []}`; see [Client configuration](#client-configuration).
 
+With [accounting](#accounting) on, each pool also says what a reservation in it costs, and whether the balance of the client's account covers it:
+
+```json
+{
+  "name": "rpi5",
+  "enabled-duts": 3,
+  "free-duts": 1,
+  "token-cost": 2,
+  "reservation-minutes": 120,
+  "reservation-tokens": 2.0,
+  "affordable": true
+}
+```
+
+`token-cost` is the cost of the pool in `pool-costs`, and `reservation-tokens` what one reservation of `reservation-minutes` takes from the balance. The call applies the recharges that are due before it compares.
+
 Missing or invalid `client-key` returns `status = -1`; an invalid SSH override returns `status = -5` (see [Client SSH overrides](#client-ssh-overrides)).
 
 ### Reservation: /reserve
@@ -719,8 +735,8 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 **Subcommands**:
 
-- **`pools`**
-  Calls `/pools` and prints one row per reservable pool with its enabled and free DUT counts:
+- **`pools [--json]`**
+  Calls `/pools` and prints one row per reservable pool with its enabled and free DUT counts (`--json` prints the service response instead, with the token prices when accounting is on):
 
   ```text
   POOL                ENABLED  FREE
