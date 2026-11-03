@@ -1514,19 +1514,155 @@ def account_history():
         return _error_response(-10, "accounting is off")
     body = request.get_json(silent=True) or {}
     try:
-        filters = _history_filters(body)
+        page = _history_page(store, request.client, body)
     except ValueError as e:
         return _error_response(-99, str(e))
+    return jsonify({"status": 0, **page}), 200
 
+
+def _history_page(store, client: dict, body: dict) -> dict:
+    """One page of the ledger of the client's account; ValueError for a
+    bad filter."""
+    filters = _history_filters(body)
     # Settle first, so recharges that are due show up.
-    account_id = _account_summary(
-        store, request.client, _now_epoch())["account-id"]
+    account_id = _account_summary(store, client, _now_epoch())["account-id"]
     entries = [_history_entry(r)
                for r in store.history(account_id, **filters)]
     full = entries and len(entries) == filters["limit"]
-    return jsonify({"status": 0, "account-id": account_id,
-                    "entries": entries,
-                    "next-before": entries[-1]["id"] if full else None}), 200
+    return {"account-id": account_id, "entries": entries,
+            "next-before": entries[-1]["id"] if full else None}
+
+
+# ---------------------------------------------------------------------------
+# /conf/account/...: accounting for the admin
+# ---------------------------------------------------------------------------
+#
+# The account is named by one of its clients, since the quota of the
+# account comes from the client configuration.
+
+def admin_accounting(func):
+    """Check the admin key, then hand the store and the body over."""
+    @wraps(func)
+    def wrapper():
+        body = request.get_json(silent=True) or {}
+        if not _check_admin_key_from_body(body):
+            return jsonify({"error": "invalid admin-key"}), 403
+        store = accounting_store
+        if store is None:
+            return jsonify({"result": -10, "error": "accounting is off"}), 200
+        return func(store, body)
+    return wrapper
+
+
+def _client_by_name(name):
+    with state_lock:
+        return next((c for c in clients if c["name"] == name), None)
+
+
+def _admin_result(code: int, error: str):
+    return jsonify({"result": code, "error": error}), 200
+
+
+def _admin_credit_args(body: dict, negative: bool):
+    """Tokens in millitokens, reason and idempotency key of a credit;
+    ValueError for a missing or bad one."""
+    for key in ("reason", "idempotency-key"):
+        if not isinstance(body.get(key), str) or not body[key].strip():
+            raise ValueError(f"{key} missing")
+    tokens = body.get("tokens")
+    if not isinstance(tokens, (int, float)) or isinstance(tokens, bool) \
+            or (tokens < 0 and not negative):
+        raise ValueError("tokens must be a number"
+                         + ("" if negative else " >= 0"))
+    return accounting.to_milli(tokens), body["reason"], body["idempotency-key"]
+
+
+def _admin_credit(store, body: dict, set_to: bool):
+    """recharge (by an amount) and set-balance (to a target) in one."""
+    client = _client_by_name(body.get("client"))
+    if client is None:
+        return _admin_result(-1, "client not found")
+    try:
+        milli, reason, key = _admin_credit_args(body, negative=not set_to)
+        amount = {"target" if set_to else "amount": milli}
+        store.credit(_account_id(client), _account_policy(client),
+                     _now_epoch(), reason=reason, idempotency_key=key,
+                     actor="admin", **amount)
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    return jsonify({"result": 0, **_account_summary(
+        store, client, _now_epoch())}), 200
+
+
+@server.route("/conf/account/info", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_info(store, body):
+    """The account of a client, its effective policy and its clients."""
+    client = _client_by_name(body.get("client"))
+    if client is None:
+        return _admin_result(-1, "client not found")
+    account = _account_id(client)
+    with state_lock:
+        names = sorted(c["name"] for c in clients if _account_id(c) == account)
+    return jsonify({"result": 0,
+                    **_account_summary(store, client, _now_epoch()),
+                    "enforcement": _enforcement_mode(client),
+                    "clients": names}), 200
+
+
+@server.route("/conf/account/recharge", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_recharge(store, body):
+    """Add tokens to an account, or take them away with a negative
+    amount."""
+    return _admin_credit(store, body, set_to=False)
+
+
+@server.route("/conf/account/set-balance", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_set_balance(store, body):
+    """Set the balance of an account."""
+    return _admin_credit(store, body, set_to=True)
+
+
+@server.route("/conf/account/ledger", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_ledger(store, body):
+    """The ledger of a client's account, as /account/history gives it."""
+    client = _client_by_name(body.get("client"))
+    if client is None:
+        return _admin_result(-1, "client not found")
+    try:
+        page = _history_page(store, client, body)
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    return jsonify({"result": 0, **page}), 200
+
+
+@server.route("/conf/account/report", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_report(store, body):
+    """
+    Ledger totals by account, pool and kind, between ``since`` and
+    ``until``, for one ``client``'s account or ``pool`` if given.
+    """
+    account = None
+    if body.get("client") is not None:
+        client = _client_by_name(body["client"])
+        if client is None:
+            return _admin_result(-1, "client not found")
+        account = _account_id(client)
+    try:
+        times = {k: _config_number(body[k], k, integer=True)
+                 for k in ("since", "until") if body.get(k) is not None}
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    rows = store.report(account=account, pool=body.get("pool"), **times)
+    return jsonify({"result": 0, "rows": [{
+        "account-id": r["account_id"], "pool": r["pool"], "kind": r["kind"],
+        "entries": r["entries"],
+        "tokens": accounting.to_tokens(r["amount"]),
+        "minutes": r["minutes"]} for r in rows]}), 200
 
 
 # ---------------------------------------------------------------------------
