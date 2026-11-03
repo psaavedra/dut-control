@@ -3068,3 +3068,97 @@ def test_reserve_concurrent_calls_share_the_balance(monkeypatch,
         statuses = sorted(r["status"] for r in pool.map(post, range(2)))
 
     assert statuses == [-6, 0]
+
+
+# ---------------------------------------------------------------------------
+# /conf/account/...
+# ---------------------------------------------------------------------------
+
+ACCOUNT_ADMIN_PATHS = ["/conf/account/info", "/conf/account/recharge",
+                       "/conf/account/set-balance", "/conf/account/ledger",
+                       "/conf/account/report"]
+
+
+@pytest.fixture
+def admin_key(monkeypatch):
+    monkeypatch.setattr(server_mod, "admin_key", "the-admin-key")
+    return "the-admin-key"
+
+
+def _admin(flask_client, path, admin_key, **body):
+    return flask_client.post(path, json={"admin-key": admin_key, **body})
+
+
+@pytest.mark.parametrize("path", ACCOUNT_ADMIN_PATHS)
+def test_account_admin_needs_the_key_and_accounting(flask_client, admin_key,
+                                                    path):
+    assert _admin(flask_client, path, "wrong").status_code == 403
+    assert _admin(flask_client, path, admin_key).get_json() == {
+        "result": -10, "error": "accounting is off"}
+
+
+def test_admin_recharge_needs_a_reason_and_applies_once(
+        flask_client, admin_key, accounting_on):
+    _one_shared_dut_setup()
+    body = {"client": "client-01", "tokens": 5, "idempotency-key": "k1"}
+
+    data = _admin(flask_client, "/conf/account/recharge", admin_key,
+                  **body).get_json()
+    assert (data["result"], data["error"]) == (-2, "reason missing")
+
+    for _ in range(2):
+        data = _admin(flask_client, "/conf/account/recharge", admin_key,
+                      reason="demo", **body).get_json()
+    assert (data["result"], data["tokens-available"]) == (0, 15.0)
+
+
+def test_admin_set_balance_takes_no_negative(flask_client, admin_key,
+                                             accounting_on):
+    _one_shared_dut_setup()
+    body = {"client": "client-01", "reason": "reset"}
+
+    data = _admin(flask_client, "/conf/account/set-balance", admin_key,
+                  tokens=-1, **{"idempotency-key": "k1"}, **body).get_json()
+    assert data["result"] == -2
+
+    data = _admin(flask_client, "/conf/account/set-balance", admin_key,
+                  tokens=3, **{"idempotency-key": "k2"}, **body).get_json()
+    assert (data["result"], data["tokens-available"]) == (0, 3.0)
+
+
+def test_admin_info_and_ledger_name_the_account_by_a_client(
+        flask_client, monkeypatch, admin_key, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    _reserve_json(flask_client, client)
+
+    info = _admin(flask_client, "/conf/account/info", admin_key,
+                  client="client-01").get_json()
+    assert (info["clients"], info["enforcement"]) == (["client-01"],
+                                                      "observe")
+    ledger = _admin(flask_client, "/conf/account/ledger", admin_key,
+                    client="client-01", kind="charge").get_json()
+    assert [e["pool"] for e in ledger["entries"]] == ["rpi5"]
+    assert _admin(flask_client, "/conf/account/ledger", admin_key,
+                  client="nobody").get_json()["result"] == -1
+
+
+def test_admin_report_adds_up_the_ledger(flask_client, monkeypatch,
+                                         admin_key, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    now = int(time.time())
+    for second in range(2):
+        # A released DUT stays taken for the rest of that second.
+        monkeypatch.setattr(server_mod, "_now_epoch",
+                            lambda: now + second)
+        token = _reserve_json(flask_client, client)["token"]
+        flask_client.post("/lease", json={"client-key": client["key"],
+                                          "token": token})
+
+    data = _admin(flask_client, "/conf/account/report", admin_key,
+                  client="client-01", pool="rpi5").get_json()
+
+    assert [(r["kind"], r["entries"], r["tokens"], r["minutes"])
+            for r in data["rows"] if r["kind"] == "charge"] == \
+        [("charge", 2, -4.0, 240)]
