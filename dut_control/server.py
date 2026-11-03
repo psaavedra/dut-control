@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import ipaddress
+import json
 import os
 import random
 import re
@@ -19,6 +20,8 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 import yaml
 
+from dut_control import accounting
+
 # ---------------------------------------------------------------------------
 # Global definitions
 # ---------------------------------------------------------------------------
@@ -32,6 +35,7 @@ MAX_UPLOAD_BYTES = 8 * 1024 ** 3
 # Enough to take out the partition table, /boot and the head of the
 # rootfs on the usual layouts.
 WIPE_DEFAULT_BYTES = 128 * _MIB
+RESERVATION_MINUTES = 120
 
 _SSH_SKIP_HOST_CHECK = [
     "-o", "StrictHostKeyChecking=no",
@@ -46,6 +50,9 @@ _SSH_SKIP_HOST_CHECK = [
 CONFIG_DIR = Path(os.environ.get("DUT_CONTROL_DIR", "dut-control"))
 
 admin_key = None
+accounting_conf = {}  # see _normalize_accounting()
+accounting_store = None  # an AccountingStore when accounting is on
+reserve_attempts = {}  # account-id -> epochs of recent /reserve calls
 nodes = []       # list[dict]
 clients = []     # list[dict]
 reserves = []    # list[dict]
@@ -230,6 +237,170 @@ def _normalize_allowed_pools(value) -> list[str]:
     return list(dict.fromkeys(str(v) for v in value))
 
 
+# ---------------------------------------------------------------------------
+# Accounting and quota configuration
+# ---------------------------------------------------------------------------
+#
+# A bad value raises instead of falling back to a default: these keys
+# decide what a team may spend, so a typo must not change it in silence.
+
+_ENFORCEMENT_MODES = ("observe", "warn", "reject")
+
+_ACCOUNTING_DEFAULTS = {
+    "enabled": False,
+    "enforcement": "observe",
+    "token-minutes": 120,
+    "default-monthly-token-limit": 40,
+    "default-weekly-recharge-tokens": 10,
+    "recharge-weekday": 1,
+    "recharge-hour-utc": 0,
+    "pool-costs": {},
+    "strict-pool-costs": False,
+}
+_ACCOUNTING_KEYS = {*_ACCOUNTING_DEFAULTS, "default-balance-cap", "database"}
+
+_QUOTA_TOKENS = ("monthly-token-limit", "weekly-recharge-tokens",
+                 "balance-cap")
+_QUOTA_KEYS = {*_QUOTA_TOKENS, "enabled", "max-active-reservations",
+               "pool-concurrency", "reserve-rate"}
+
+
+def _check_known_keys(section: dict, known: set, what: str):
+    unknown = sorted(str(k) for k in section if k not in known)
+    if unknown:
+        raise ValueError(f"{what} has unknown keys: {', '.join(unknown)}")
+
+
+def _config_bool(value, what: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{what} must be true or false")
+    return value
+
+
+def _config_number(value, what: str, integer=False, positive=False):
+    """A number of tokens, minutes and the like; never a boolean."""
+    kinds = (int,) if integer else (int, float)
+    ok = isinstance(value, kinds) and not isinstance(value, bool)
+    if not ok or value < 0 or (positive and value == 0):
+        sign = "positive" if positive else "non-negative"
+        kind = "integer" if integer else "number"
+        raise ValueError(f"{what} must be a {sign} {kind}")
+    return value
+
+
+def _config_int_between(value, what: str, low: int, high: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) \
+            or not low <= value <= high:
+        raise ValueError(f"{what} must be an integer from {low} to {high}")
+    return value
+
+
+def _config_name(value, what: str) -> str:
+    """Same rule as a pool name: a non-empty string or number."""
+    if not _is_pool_name(value):
+        raise ValueError(f"{what} must be a name")
+    return str(value)
+
+
+def _config_per_pool(value, what: str, integer=False) -> dict:
+    """A mapping of pool name to a positive number."""
+    section = _normalize_section(value)
+    if not isinstance(value, (dict, list)):
+        raise ValueError(f"{what} must map pool names to numbers")
+    return {_config_name(k, f"{what} key"):
+            _config_number(v, f"{what} {k}", integer, positive=True)
+            for k, v in section.items()}
+
+
+def _state_dir(config_dir: Path) -> Path:
+    return Path(os.environ.get("DUT_CONTROL_STATE_DIR", config_dir))
+
+
+def _normalize_accounting(value, config_dir: Path) -> dict:
+    """
+    Check the ``accounting`` section of conf.yml and fill in defaults.
+
+    No section, or ``enabled: false``, keeps accounting off.
+    """
+    section = dict(_normalize_section(value))
+    _check_known_keys(section, _ACCOUNTING_KEYS, "accounting")
+    acc = {**_ACCOUNTING_DEFAULTS, **section}
+
+    acc["enabled"] = _config_bool(acc["enabled"], "accounting enabled")
+    acc["strict-pool-costs"] = _config_bool(
+        acc["strict-pool-costs"], "accounting strict-pool-costs")
+    if acc["enforcement"] not in _ENFORCEMENT_MODES:
+        raise ValueError("accounting enforcement must be one of "
+                         + ", ".join(_ENFORCEMENT_MODES))
+    acc["token-minutes"] = _config_number(
+        acc["token-minutes"], "accounting token-minutes",
+        integer=True, positive=True)
+    # No default-balance-cap means the monthly limit of each account.
+    for key in ("default-monthly-token-limit",
+                "default-weekly-recharge-tokens", "default-balance-cap"):
+        if key in acc:
+            acc[key] = _config_number(acc[key], f"accounting {key}")
+    acc["recharge-weekday"] = _config_int_between(
+        acc["recharge-weekday"], "accounting recharge-weekday", 1, 7)
+    acc["recharge-hour-utc"] = _config_int_between(
+        acc["recharge-hour-utc"], "accounting recharge-hour-utc", 0, 23)
+    acc["pool-costs"] = _config_per_pool(
+        acc["pool-costs"], "accounting pool-costs")
+    acc["database"] = str(acc.get("database")
+                          or _state_dir(config_dir) / "accounting.sqlite3")
+    return acc
+
+
+def _normalize_reserve_rate(value) -> dict:
+    rate = dict(_normalize_section(value))
+    _check_known_keys(rate, {"requests", "window-seconds"},
+                      "quota reserve-rate")
+    return {key: _config_number(rate.get(key), f"quota reserve-rate {key}",
+                                integer=True, positive=True)
+            for key in ("requests", "window-seconds")}
+
+
+def _normalize_quota(value) -> dict:
+    """
+    Check a client's ``quota`` section.
+
+    Only the keys the YAML has are kept; the rest come from the
+    defaults in conf.yml when they are used.
+    """
+    quota = dict(_normalize_section(value))
+    _check_known_keys(quota, _QUOTA_KEYS, "client quota")
+    quota["enabled"] = _config_bool(quota.get("enabled", True),
+                                    "quota enabled")
+    for key in _QUOTA_TOKENS:
+        if key in quota:
+            quota[key] = _config_number(quota[key], f"quota {key}")
+    if "max-active-reservations" in quota:
+        quota["max-active-reservations"] = _config_number(
+            quota["max-active-reservations"],
+            "quota max-active-reservations", integer=True, positive=True)
+    if "pool-concurrency" in quota:
+        quota["pool-concurrency"] = _config_per_pool(
+            quota["pool-concurrency"], "quota pool-concurrency",
+            integer=True)
+    if "reserve-rate" in quota:
+        quota["reserve-rate"] = _normalize_reserve_rate(quota["reserve-rate"])
+    return quota
+
+
+def _check_shared_accounts(clients: list):
+    """
+    Clients may share an account, e.g. an old and a new key during a
+    rotation, but then they must agree on its quota.
+    """
+    quotas = {}
+    for client in clients:
+        account = client.get("account-id", client["name"])
+        quota = quotas.setdefault(account, client.get("quota"))
+        if quota != client.get("quota"):
+            raise ValueError(
+                f"clients of account {account} have different quotas")
+
+
 def _load_yaml_file(path: Path):
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -250,6 +421,8 @@ def _load_conf(config_dir: Path):
 
     if not data.get("admin-key"):
         raise ValueError("conf.yml must contain 'admin-key'")
+    data["accounting"] = _normalize_accounting(
+        data.get("accounting", {}), config_dir)
     return data
 
 
@@ -319,24 +492,75 @@ def _load_clients(config_dir: Path):
             if "allowed-pools" in doc:
                 client["allowed-pools"] = _normalize_allowed_pools(
                     doc["allowed-pools"])
+            # Same rule: set only when the YAML has the key.
+            if "account-id" in doc:
+                client["account-id"] = _config_name(
+                    doc["account-id"], "client account-id")
+            if "quota" in doc:
+                client["quota"] = _normalize_quota(doc["quota"])
             result.append(client)
 
+    _check_shared_accounts(result)
     return result
+
+
+def _mixed_cost_duts(nodes: list, costs: dict) -> list[str]:
+    """The DUTs in pools of different costs, each with its prices."""
+    found = []
+    for node in nodes:
+        for dut in node.get("duts", []):
+            prices = {p: costs.get(p, 1) for p in _dut_pools(dut)}
+            if len(set(prices.values())) > 1:
+                found.append(f"{dut['name']} (" + ", ".join(
+                    f"{p}={c:g}" for p, c in prices.items()) + ")")
+    return found
+
+
+def _check_pool_costs(conf: dict, nodes: list):
+    """
+    A DUT is priced by the pool it is reserved through, so a DUT in a
+    cheap and an expensive pool can be had at the cheap price. Warn about it,
+    or refuse the configuration with strict-pool-costs.
+    """
+    if not conf["enabled"]:
+        return
+    mixed = _mixed_cost_duts(nodes, conf["pool-costs"])
+    if not mixed:
+        return
+    message = "DUTs in pools of different costs: " + "; ".join(mixed)
+    if conf["strict-pool-costs"]:
+        raise ValueError(message)
+    server.logger.warning(message)
+
+
+def _open_store(conf: dict):
+    """The store for an accounting section; the open one if it is the
+    same file, so a reload does not reopen it."""
+    if not conf["enabled"]:
+        return None
+    store = accounting_store
+    if store is not None and store.path == conf["database"]:
+        return store
+    return accounting.AccountingStore(conf["database"])
 
 
 def reload_config():
     """
-    Reload admin_key, nodes, clients from YAML.
+    Reload admin_key, accounting_conf, nodes, clients from YAML.
     Does NOT touch reserves/processes.
     """
-    global admin_key, nodes, clients
+    global admin_key, accounting_conf, accounting_store
 
     conf = _load_conf(CONFIG_DIR)
     new_nodes = _load_nodes(CONFIG_DIR)
     new_clients = _load_clients(CONFIG_DIR)
+    _check_pool_costs(conf["accounting"], new_nodes)
+    new_store = _open_store(conf["accounting"])
 
     with state_lock:
         admin_key = conf["admin-key"]
+        accounting_conf = conf["accounting"]
+        accounting_store = new_store
         server.config["MAX_CONTENT_LENGTH"] = int(
             conf.get("max-upload-bytes", MAX_UPLOAD_BYTES))
         nodes[:] = new_nodes
@@ -857,11 +1081,227 @@ def _rollback_reserve(token: str):
         reserves[:] = [r for r in reserves if r.get("token") != token]
 
 
+# ---------------------------------------------------------------------------
+# Accounting hooks; each one does nothing with accounting off.
+# ---------------------------------------------------------------------------
+
+def _account_id(client: dict) -> str:
+    return str(client.get("account-id", client["name"]))
+
+
+def _account_policy(client: dict) -> accounting.Policy:
+    """The defaults of conf.yml, with the client's quota on top."""
+    quota = client.get("quota", {})
+
+    def tokens(key, default):
+        return quota.get(key, accounting_conf.get(f"default-{key}", default))
+
+    monthly = tokens("monthly-token-limit", None)
+    return accounting.Policy(
+        monthly_limit=accounting.to_milli(monthly),
+        weekly_recharge=accounting.to_milli(
+            tokens("weekly-recharge-tokens", None)),
+        balance_cap=accounting.to_milli(tokens("balance-cap", monthly)),
+        recharge_weekday=accounting_conf["recharge-weekday"],
+        recharge_hour_utc=accounting_conf["recharge-hour-utc"])
+
+
+def _reservation_price(pool: str) -> int:
+    """Millitokens for one reservation, by the pool asked for, not by
+    the other pools of the DUT, so the price is known in advance."""
+    return accounting.reservation_price(
+        RESERVATION_MINUTES, accounting_conf["token-minutes"],
+        accounting_conf["pool-costs"].get(pool, 1))
+
+
+def _charge_reserve(client: dict, pool: str, dut: dict, token: str,
+                    now: int):
+    """
+    Charge a new reservation. The quota gate has already refused what
+    it had to under the same lock, so the charge itself never fails for
+    lack of tokens: in observe and warn modes the balance may go below
+    zero.
+    """
+    if accounting_store is None:
+        return None
+    return accounting_store.charge(
+        _account_id(client), _account_policy(client), now, token=token,
+        pool=pool, dut_name=dut["name"], minutes=RESERVATION_MINUTES,
+        amount=_reservation_price(pool), actor=client["name"],
+        allow_negative=True)
+
+
+def _accounting_fields(client: dict, charge, valid_until: int,
+                       warnings: list) -> dict:
+    """What /reserve adds to its answer; nothing with accounting off."""
+    if charge is None:
+        return {}
+    fields = {
+        "account-id": _account_id(client),
+        "charged-tokens": accounting.to_tokens(charge["charged"]),
+        "tokens-available": accounting.to_tokens(charge["balance"]),
+        "valid-until": valid_until,
+    }
+    if warnings:
+        fields["quota-warning"] = warnings
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# Quota gate of /reserve
+# ---------------------------------------------------------------------------
+
+class _QuotaProblem:
+    """A quota rule a reservation would break, as /reserve reports it."""
+
+    def __init__(self, status: int, code: str, error: str, **details):
+        self.status, self.code = status, code
+        self.body = {"status": status, "error": error, "error-code": code,
+                     **details}
+
+    def response(self):
+        return jsonify(self.body), 200
+
+
+def _enforcement_mode(client: dict) -> str:
+    """The global mode, but observe for an account with no quota."""
+    if not client.get("quota", {}).get("enabled", True):
+        return "observe"
+    return accounting_conf["enforcement"]
+
+
+def _rate_problem(client: dict, account: str, now: int):
+    """
+    Too many /reserve calls in the window of ``reserve-rate``. A call
+    over the limit is not counted, so a client that waits gets through.
+    """
+    rate = client.get("quota", {}).get("reserve-rate")
+    if rate is None:
+        return None
+    window = rate["window-seconds"]
+    recent = [t for t in reserve_attempts.get(account, [])
+              if t > now - window]
+    reserve_attempts[account] = recent
+    if len(recent) >= rate["requests"]:
+        return _QuotaProblem(-9, "rate_limited", "too many reserve calls",
+                             **{"retry-after": recent[0] + window - now})
+    recent.append(now)
+    return None
+
+
+def _account_reservations_in(account: str, pool: str, now: int) -> int:
+    """Unexpired reservations of the account on DUTs of the pool."""
+    with state_lock:
+        keys = {c["key"] for c in clients if _account_id(c) == account}
+        names = {r["dut-name"] for r in reserves
+                 if r.get("client-key") in keys
+                 and r.get("valid-until", 0) >= now}
+    return sum(1 for name in names
+               if _dut_in_pool(_get_dut_and_node_by_name(name)[1] or {},
+                               pool))
+
+
+def _concurrency_problem(client: dict, account: str, pool: str, now: int):
+    """Too many reservations held at once, in all or in this pool."""
+    quota = client.get("quota", {})
+    limit = quota.get("max-active-reservations")
+    if limit is not None and \
+            _account_active_reservations(account, now) >= limit:
+        return _QuotaProblem(-8, "concurrency_limit",
+                             "too many active reservations",
+                             **{"max-active-reservations": limit})
+    limit = quota.get("pool-concurrency", {}).get(pool)
+    if limit is not None and \
+            _account_reservations_in(account, pool, now) >= limit:
+        return _QuotaProblem(-8, "concurrency_limit",
+                             "too many active reservations in pool",
+                             **{"pool-concurrency": limit})
+    return None
+
+
+def _balance_problem(store, client: dict, account: str, pool: str,
+                     now: int):
+    """The balance does not cover one reservation in the pool."""
+    state = store.settle(account, _account_policy(client), now)
+    price = _reservation_price(pool)
+    if state["balance"] >= price:
+        return None
+    tokens = accounting.to_tokens
+    return _QuotaProblem(-6, "quota_exceeded", "quota exceeded", **{
+        "tokens-required": tokens(price),
+        "tokens-available": tokens(state["balance"]),
+        "next-recharge-at": state["next-recharge-at"],
+        "next-recharge-at-iso": accounting.iso(state["next-recharge-at"]),
+        "next-recharge-tokens": tokens(state["next-recharge"]),
+    })
+
+
+def _quota_gate(client: dict, pool: str, now: int):
+    """
+    Check a reservation against the quota of the client's account.
+    Returns the response to refuse it with, or None, and the warnings
+    to add to its answer. Call it under state_lock, so the checks and
+    the charge see the same state.
+    """
+    store = accounting_store
+    if store is None:
+        return None, []
+    account = _account_id(client)
+    problems = [p for p in (
+        _rate_problem(client, account, now),
+        _concurrency_problem(client, account, pool, now),
+        _balance_problem(store, client, account, pool, now)) if p]
+    mode = _enforcement_mode(client)
+    if problems and mode == "reject":
+        return problems[0].response(), []
+    return None, [p.code for p in problems] if mode == "warn" else []
+
+
+def _undo_reserve(token: str, now: int):
+    """Drop a reservation that never ran and give its charge back."""
+    _rollback_reserve(token)
+    if accounting_store is not None:
+        accounting_store.rollback(token, now)
+
+
+def _refund_reserves(tokens: set[str], now: int):
+    """
+    Give back the unused time of reservations released early. A failed
+    refund is logged and does not fail the release, which is done.
+    """
+    if accounting_store is None:
+        return
+    for token in tokens:
+        try:
+            accounting_store.refund(token, now)
+        except Exception:
+            server.logger.exception("refund of a released reservation failed")
+
+
 @server.route("/pools", methods=["POST", "PUT"])
 @validate_client
 def pools():
     """List reservable pools with their enabled and free DUT counts."""
-    return jsonify({"status": 0, "pools": _list_pools(request.client)}), 200
+    listing = _list_pools(request.client)
+    store = accounting_store
+    if store is not None:
+        _add_pool_prices(store, request.client, listing, _now_epoch())
+    return jsonify({"status": 0, "pools": listing}), 200
+
+
+def _add_pool_prices(store, client: dict, listing: list, now: int):
+    """What a reservation in each pool costs, and whether the balance
+    of the client's account covers it."""
+    balance = store.settle(
+        _account_id(client), _account_policy(client), now)["balance"]
+    for entry in listing:
+        price = _reservation_price(entry["name"])
+        entry.update({
+            "token-cost": accounting_conf["pool-costs"].get(entry["name"], 1),
+            "reservation-minutes": RESERVATION_MINUTES,
+            "reservation-tokens": accounting.to_tokens(price),
+            "affordable": balance >= price,
+        })
 
 
 @server.route("/reserve", methods=["POST", "PUT"])
@@ -872,38 +1312,44 @@ def reserve():
     duts_in_pool = request.duts_in_pool
     now = _now_epoch()
 
-    # Early check: any available DUTs?
-    in_use_duts = _reserved_dut_names(now)
-    available = [(node, dut) for (node, dut) in duts_in_pool
-                 if dut["name"] not in in_use_duts]
-    if not available:
-        return _error_response(-4, "all duts in use already")
-
-    node, dut = random.choice(available)
-
-    # Early check: free port?
-    free_port = _find_free_port_for_client(request.client)
-    if free_port is None:
-        return _error_response(-4, "no free ports for client")
-
-    # Create and store reservation
-    token = secrets.token_hex(8)
-    reserve_entry = {
-        "token": token,
-        "valid-from": now,
-        "valid-until": now + 2 * 3600,  # 2 hours
-        "client-key": request.client["key"],
-        "dut-name": dut["name"],
-    }
+    # One lock over the whole claim: the DUT, the port and the tunnel
+    # entry that marks the port as used. Two calls at the same time
+    # could pick the same DUT or port otherwise. Popen does not wait
+    # for ssh to connect, so the lock is held only for a short time.
     with state_lock:
-        reserves.append(reserve_entry)
+        refusal, warnings = _quota_gate(request.client, request.pool, now)
+        if refusal is not None:
+            return refusal
 
-    # Start tunnel or rollback
-    try:
-        _start_ssh_tunnel(request.client, dut, free_port, token)
-    except Exception as e:
-        _rollback_reserve(token)
-        return _error_response(-99, f"internal error: {e}")
+        in_use_duts = _reserved_dut_names(now)
+        available = [(node, dut) for (node, dut) in duts_in_pool
+                     if dut["name"] not in in_use_duts]
+        if not available:
+            return _error_response(-4, "all duts in use already")
+
+        node, dut = random.choice(available)
+
+        free_port = _find_free_port_for_client(request.client)
+        if free_port is None:
+            return _error_response(-4, "no free ports for client")
+
+        token = secrets.token_hex(8)
+        valid_until = now + RESERVATION_MINUTES * 60
+        reserves.append({
+            "token": token,
+            "valid-from": now,
+            "valid-until": valid_until,
+            "client-key": request.client["key"],
+            "dut-name": dut["name"],
+        })
+
+        try:
+            charge = _charge_reserve(
+                request.client, request.pool, dut, token, now)
+            _start_ssh_tunnel(request.client, dut, free_port, token)
+        except Exception as e:
+            _undo_reserve(token, now)
+            return _error_response(-99, f"internal error: {e}")
 
     return jsonify({
         "status": 0,
@@ -913,6 +1359,8 @@ def reserve():
         "ssh-port": dut["network"]["ssh-port"],
         "tunnel-ssh-port": free_port,
         "client-ssh-overrides": request.client.get("ssh-overrides", []),
+        **_accounting_fields(request.client, charge, valid_until,
+                             warnings),
     }), 200
 
 
@@ -1001,10 +1449,366 @@ def lease():
 
         _terminate_processes(tokens_to_release)
         _expire_reserves(tokens_to_release, now)
+        _refund_reserves(tokens_to_release, now)
         return jsonify({"status": 0}), 200
 
     except Exception as e:
         return _error_response(-99, f"internal error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# /account and /account/history
+# ---------------------------------------------------------------------------
+
+HISTORY_LIMIT = 100
+HISTORY_MAX_LIMIT = 1000
+
+
+def _account_active_reservations(account: str, now: int) -> int:
+    """Unexpired reservations of every client of the account."""
+    with state_lock:
+        keys = {c["key"] for c in clients if _account_id(c) == account}
+        return sum(1 for r in reserves
+                   if r.get("client-key") in keys
+                   and r.get("valid-until", 0) >= now)
+
+
+def _account_summary(store, client: dict, now: int) -> dict:
+    """Settle the account of the client and say where it stands."""
+    policy = _account_policy(client)
+    state = store.settle(_account_id(client), policy, now)
+    tokens = accounting.to_tokens
+    return {
+        "account-id": state["account-id"],
+        "tokens-available": tokens(state["balance"]),
+        "monthly-token-limit": tokens(policy.monthly_limit),
+        "weekly-recharge-tokens": tokens(policy.weekly_recharge),
+        "balance-cap": tokens(policy.balance_cap),
+        "period-start": state["period-start"],
+        "period-end": state["period-end"],
+        "period-granted": tokens(state["period-granted"]),
+        "next-recharge-at": state["next-recharge-at"],
+        "next-recharge-at-iso": accounting.iso(state["next-recharge-at"]),
+        "next-recharge-tokens": tokens(state["next-recharge"]),
+        "active-reservations": _account_active_reservations(
+            state["account-id"], now),
+    }
+
+
+def _history_filters(body: dict, names=("kind", "pool")) -> dict:
+    """The paging filters of /account/history, or of another listing
+    with other ``names`` to match; ValueError for a bad one."""
+    filters = {key: _config_number(body[key], key, integer=True)
+               for key in ("since", "until", "before", "limit")
+               if body.get(key) is not None}
+    filters.update({key: str(body[key]) for key in names
+                    if body.get(key) is not None})
+    filters["limit"] = min(filters.get("limit", HISTORY_LIMIT),
+                           HISTORY_MAX_LIMIT)
+    return filters
+
+
+def _history_entry(row: dict) -> dict:
+    """A ledger row without the hash of the reservation token."""
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "ts-iso": accounting.iso(row["ts"]),
+        "kind": row["kind"],
+        "tokens": accounting.to_tokens(row["amount_millitokens"]),
+        "balance-after": accounting.to_tokens(
+            row["balance_after_millitokens"]),
+        "pool": row["pool"],
+        "dut-name": row["dut_name"],
+        "minutes": row["minutes"],
+        "actor": row["actor"],
+        "reason": row["reason"],
+    }
+
+
+@server.route("/account", methods=["POST", "PUT"])
+@validate_client
+def account():
+    """The balance of the client's account and its next recharge."""
+    store = accounting_store
+    if store is None:
+        return _error_response(-10, "accounting is off")
+    summary = _account_summary(store, request.client, _now_epoch())
+    return jsonify({"status": 0, **summary}), 200
+
+
+@server.route("/account/history", methods=["POST", "PUT"])
+@validate_client
+def account_history():
+    """
+    Ledger entries of the client's account, newest first. A full page
+    gives ``next-before``, to pass as ``before`` for the next one.
+    """
+    store = accounting_store
+    if store is None:
+        return _error_response(-10, "accounting is off")
+    body = request.get_json(silent=True) or {}
+    try:
+        page = _history_page(store, request.client, body)
+    except ValueError as e:
+        return _error_response(-99, str(e))
+    return jsonify({"status": 0, **page}), 200
+
+
+def _history_page(store, client: dict, body: dict) -> dict:
+    """One page of the ledger of the client's account; ValueError for a
+    bad filter."""
+    filters = _history_filters(body)
+    # Settle first, so recharges that are due show up.
+    account_id = _account_summary(store, client, _now_epoch())["account-id"]
+    entries = [_history_entry(r)
+               for r in store.history(account_id, **filters)]
+    full = entries and len(entries) == filters["limit"]
+    return {"account-id": account_id, "entries": entries,
+            "next-before": entries[-1]["id"] if full else None}
+
+
+# ---------------------------------------------------------------------------
+# /conf/account/...: accounting for the admin
+# ---------------------------------------------------------------------------
+#
+# The account is named by one of its clients, since the quota of the
+# account comes from the client configuration.
+
+def admin_accounting(func):
+    """Check the admin key, then hand the store and the body over."""
+    @wraps(func)
+    def wrapper():
+        body = request.get_json(silent=True) or {}
+        if not _check_admin_key_from_body(body):
+            return jsonify({"error": "invalid admin-key"}), 403
+        store = accounting_store
+        if store is None:
+            return jsonify({"result": -10, "error": "accounting is off"}), 200
+        return func(store, body)
+    return wrapper
+
+
+def _client_by_name(name):
+    with state_lock:
+        return next((c for c in clients if c["name"] == name), None)
+
+
+def _admin_result(code: int, error: str):
+    return jsonify({"result": code, "error": error}), 200
+
+
+def _admin_credit_args(body: dict, negative: bool):
+    """Tokens in millitokens, reason and idempotency key of a credit;
+    ValueError for a missing or bad one."""
+    for key in ("reason", "idempotency-key"):
+        if not isinstance(body.get(key), str) or not body[key].strip():
+            raise ValueError(f"{key} missing")
+    tokens = body.get("tokens")
+    if not isinstance(tokens, (int, float)) or isinstance(tokens, bool) \
+            or (tokens < 0 and not negative):
+        raise ValueError("tokens must be a number"
+                         + ("" if negative else " >= 0"))
+    return accounting.to_milli(tokens), body["reason"], body["idempotency-key"]
+
+
+def _admin_credit(store, body: dict, set_to: bool):
+    """recharge (by an amount) and set-balance (to a target) in one."""
+    client = _client_by_name(body.get("client"))
+    if client is None:
+        return _admin_result(-1, "client not found")
+    try:
+        milli, reason, key = _admin_credit_args(body, negative=not set_to)
+        amount = {"target" if set_to else "amount": milli}
+        store.credit(_account_id(client), _account_policy(client),
+                     _now_epoch(), reason=reason, idempotency_key=key,
+                     actor="admin", **amount)
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    return jsonify({"result": 0, **_account_summary(
+        store, client, _now_epoch())}), 200
+
+
+@server.route("/conf/account/info", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_info(store, body):
+    """The account of a client, its effective policy and its clients."""
+    client = _client_by_name(body.get("client"))
+    if client is None:
+        return _admin_result(-1, "client not found")
+    account = _account_id(client)
+    with state_lock:
+        names = sorted(c["name"] for c in clients if _account_id(c) == account)
+    return jsonify({"result": 0,
+                    **_account_summary(store, client, _now_epoch()),
+                    "enforcement": _enforcement_mode(client),
+                    "clients": names}), 200
+
+
+@server.route("/conf/account/recharge", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_recharge(store, body):
+    """Add tokens to an account, or take them away with a negative
+    amount."""
+    return _admin_credit(store, body, set_to=False)
+
+
+@server.route("/conf/account/set-balance", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_set_balance(store, body):
+    """Set the balance of an account."""
+    return _admin_credit(store, body, set_to=True)
+
+
+@server.route("/conf/account/ledger", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_ledger(store, body):
+    """The ledger of a client's account, as /account/history gives it."""
+    client = _client_by_name(body.get("client"))
+    if client is None:
+        return _admin_result(-1, "client not found")
+    try:
+        page = _history_page(store, client, body)
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    return jsonify({"result": 0, **page}), 200
+
+
+def _optional_account(body: dict):
+    """The account of ``client``, or None for every account when it is
+    not given; LookupError for an unknown client."""
+    if body.get("client") is None:
+        return None
+    client = _client_by_name(body["client"])
+    if client is None:
+        raise LookupError("client not found")
+    return _account_id(client)
+
+
+def _activity_event(row: dict) -> dict:
+    """An activity row without the hash of the reservation token."""
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "ts-iso": accounting.iso(row["ts"]),
+        "account-id": row["account_id"],
+        "action": row["action"],
+        "pool": row["pool"],
+        "dut-name": row["dut_name"],
+        "result": row["result"],
+        "error": row["error"],
+        "metadata": json.loads(row["metadata_json"]),
+    }
+
+
+@server.route("/conf/account/activity", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_activity(store, body):
+    """
+    The power, flash and wipe calls logged on reservations, newest
+    first, for one ``client``'s account or for every account, paged
+    as /account/history is.
+    """
+    try:
+        account = _optional_account(body)
+        filters = _history_filters(body, ("action", "pool"))
+    except LookupError as e:
+        return _admin_result(-1, str(e))
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    events = [_activity_event(r)
+              for r in store.activity(account=account, **filters)]
+    full = events and len(events) == filters["limit"]
+    return jsonify({"result": 0, "events": events,
+                    "next-before": events[-1]["id"] if full else None}), 200
+
+
+@server.route("/conf/account/report", methods=["POST", "PUT"])
+@admin_accounting
+def conf_account_report(store, body):
+    """
+    Ledger totals by account, pool and kind, between ``since`` and
+    ``until``, for one ``client``'s account or ``pool`` if given.
+    """
+    try:
+        account = _optional_account(body)
+        times = {k: _config_number(body[k], k, integer=True)
+                 for k in ("since", "until") if body.get(k) is not None}
+    except LookupError as e:
+        return _admin_result(-1, str(e))
+    except ValueError as e:
+        return _admin_result(-2, str(e))
+    rows = store.report(account=account, pool=body.get("pool"), **times)
+    return jsonify({"result": 0, "rows": [{
+        "account-id": r["account_id"], "pool": r["pool"], "kind": r["kind"],
+        "entries": r["entries"],
+        "tokens": accounting.to_tokens(r["amount"]),
+        "minutes": r["minutes"]} for r in rows]}), 200
+
+
+# ---------------------------------------------------------------------------
+# Audit of the actions on a reserved DUT
+# ---------------------------------------------------------------------------
+
+def _power_details(action=None):
+    return {"action": action}
+
+
+def _flash_details(**_):
+    """How the image came, and its bare name; never a path."""
+    upload = request.files.get("image")
+    if upload is not None:
+        name = Path(upload.filename or "").name
+        return {"mode": "upload", "image-name": name,
+                "bmap": "bmap" in request.files}
+    path = (request.get_json(silent=True) or {}).get("path") or ""
+    return {"mode": "named", "image-name": Path(str(path)).name}
+
+
+def _wipe_details(**_):
+    body = request.get_json(silent=True) or {}
+    return {"size-bytes": body.get("size", WIPE_DEFAULT_BYTES)}
+
+
+def _record_activity(store, action: str, details: dict, data: dict):
+    """
+    One activity row for the action just done. The error is cut at its
+    first colon: the fixed message stays, and a path an OS error may
+    carry after it does not.
+    """
+    token = _request_token()
+    reserve_entry = _get_reserve_by_token(token) or {}
+    client = _get_client_by_key(reserve_entry.get("client-key"))
+    error = data.get("error")
+    store.record_activity(
+        _now_epoch(), account=_account_id(client) if client else "",
+        token=token, action=action,
+        dut_name=reserve_entry.get("dut-name"),
+        result="success" if data.get("status") == 0 else "failed",
+        error=error.split(":")[0] if error else None, metadata=details)
+
+
+def audited(action: str, details):
+    """
+    Log what the endpoint did, success or failure, with accounting on.
+    ``details`` turns the request into safe metadata. Goes under
+    validate_token, so only actions on a valid reservation are logged.
+    A failed log does not fail the action, which is done.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            response = func(*args, **kwargs)
+            store = accounting_store
+            if store is not None:
+                try:
+                    _record_activity(store, action, details(**kwargs),
+                                     response[0].get_json())
+                except Exception:
+                    server.logger.exception(f"audit of {action} failed")
+            return response
+        return wrapper
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -1074,6 +1878,7 @@ def _power_action_error(action: str, node: dict, dut: dict):
 
 @server.route("/power/<action>", methods=["POST", "PUT"])
 @validate_token
+@audited("power", _power_details)
 def power(action):
     if action not in ("on", "off", "cycle"):
         return jsonify({"status": -99, "error": "invalid action"}), 200
@@ -1482,6 +2287,7 @@ def _flash_upload(node: dict, dut: dict, image, bmap):
 
 @server.route("/flash", methods=["POST", "PUT"])
 @validate_token
+@audited("flash", _flash_details)
 def flash():
     reserve_entry = _get_reserve_by_token(_request_token())
 
@@ -1549,6 +2355,7 @@ def _upload_too_large(_):
 
 @server.route("/wipe", methods=["POST", "PUT"])
 @validate_token
+@audited("wipe", _wipe_details)
 def wipe():
     body = request.get_json(silent=True) or {}
     token = body.get("token")

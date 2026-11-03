@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import concurrent.futures
+import json
 import threading
 
 import dut_control.server as server_mod
@@ -483,6 +484,56 @@ def test_reserve_no_free_ports(flask_client, monkeypatch):
     data = resp.get_json()
     assert data["status"] == -4
     assert "no free ports for client" in data["error"]
+
+
+@pytest.mark.parametrize("duts, port_to", [(1, 5001), (2, 5000)],
+                         ids=["one-dut", "one-port"])
+def test_reserve_concurrent_calls_do_not_share(monkeypatch, duts, port_to):
+    client = _make_client(port_from=5000, port_to=port_to)
+    node, _ = _make_node_dut(pool="pool-01")
+    node["duts"] += [dict(node["duts"][0], name=f"dut-{i:02}")
+                     for i in range(2, duts + 1)]
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    def fake_start_ssh_tunnel(c, d, remote_port, token):
+        with server_mod.state_lock:
+            server_mod.processes.append({
+                "reserve-token": token,
+                "client-name": c["name"],
+                "ports-in-use": [remote_port],
+            })
+
+    # Hold both calls once they have picked a DUT and a port. With the
+    # lock, the second one waits for the first and the barrier times
+    # out; without it, both go on with the same pick.
+    barrier = threading.Barrier(2, timeout=0.5)
+    find_free_port = server_mod._find_free_port_for_client
+
+    def slow_find_free_port(c):
+        port = find_free_port(c)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return port
+
+    monkeypatch.setattr(server_mod, "_start_ssh_tunnel", fake_start_ssh_tunnel)
+    monkeypatch.setattr(
+        server_mod, "_find_free_port_for_client", slow_find_free_port)
+
+    def post(_):
+        return server_mod.server.test_client().post(
+            "/reserve",
+            json={"client-key": client["key"], "pool": "pool-01"},
+        ).get_json()["status"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = sorted(pool.map(post, range(2)))
+
+    assert statuses == [-4, 0]
 
 
 # ---------------------------------------------------------------------------
@@ -2572,3 +2623,708 @@ def test_a_reservation_outlives_its_pool_policy(flask_client, monkeypatch):
     assert flask_client.post("/lease", json=body).get_json() == {"status": 0}
     assert server_mod.processes == []
     assert server_mod.reserves[0]["valid-until"] <= int(time.time())
+
+
+# ---------------------------------------------------------------------------
+# Accounting and quota configuration
+# ---------------------------------------------------------------------------
+
+def _load_conf_with(tmp_path, accounting_lines=""):
+    (tmp_path / "conf.yml").write_text(
+        f"---\nadmin-key: admin\n{accounting_lines}\n")
+    return server_mod._load_conf(tmp_path)["accounting"]
+
+
+def test_load_conf_keeps_accounting_off_without_the_section(tmp_path,
+                                                            monkeypatch):
+    monkeypatch.delenv("DUT_CONTROL_STATE_DIR", raising=False)
+
+    acc = _load_conf_with(tmp_path)
+
+    assert acc["enabled"] is False
+    assert acc["enforcement"] == "observe"
+    assert "default-balance-cap" not in acc
+    assert acc["database"] == str(tmp_path / "accounting.sqlite3")
+
+
+def test_load_conf_reads_the_accounting_section(tmp_path, monkeypatch):
+    monkeypatch.setenv("DUT_CONTROL_STATE_DIR", "/var/lib/dut-control")
+
+    acc = _load_conf_with(tmp_path, """accounting:
+  - enabled: true
+  - enforcement: reject
+  - default-monthly-token-limit: 80
+  - recharge-weekday: 7
+  - pool-costs:
+      rpi4: 1
+      rpi5-fast: 2.5""")
+
+    assert acc["enabled"] is True
+    assert acc["enforcement"] == "reject"
+    assert acc["recharge-weekday"] == 7
+    assert acc["pool-costs"] == {"rpi4": 1, "rpi5-fast": 2.5}
+    assert acc["database"] == "/var/lib/dut-control/accounting.sqlite3"
+
+
+@pytest.mark.parametrize("line, match", [
+    ("  - enable: true", "unknown keys: enable"),
+    ("  - enabled: maybe", "enabled"),
+    ("  - enforcement: block", "enforcement"),
+    ("  - token-minutes: 0", "token-minutes"),
+    ("  - recharge-hour-utc: 24", "recharge-hour-utc"),
+    ("  - pool-costs:\n      rpi4: 0", "pool-costs rpi4"),
+])
+def test_load_conf_rejects_a_bad_accounting_value(tmp_path, line, match):
+    with pytest.raises(ValueError, match=match):
+        _load_conf_with(tmp_path, f"accounting:\n{line}")
+
+
+def test_load_clients_leaves_account_and_quota_out_when_not_configured(
+        tmp_path):
+    _write_client_yaml(tmp_path / "clients")
+
+    client = server_mod._load_clients(tmp_path)[0]
+    assert "account-id" not in client
+    assert "quota" not in client
+
+
+def test_load_clients_reads_account_and_quota(tmp_path):
+    _write_client_yaml(tmp_path / "clients", """  account-id: team-browser
+  quota:
+    - monthly-token-limit: 80
+    - max-active-reservations: 2
+    - pool-concurrency:
+        rpi5-fast: 1
+    - reserve-rate:
+        - requests: 10
+        - window-seconds: 60""")
+
+    client = server_mod._load_clients(tmp_path)[0]
+    assert client["account-id"] == "team-browser"
+    assert client["quota"] == {
+        "enabled": True,
+        "monthly-token-limit": 80,
+        "max-active-reservations": 2,
+        "pool-concurrency": {"rpi5-fast": 1},
+        "reserve-rate": {"requests": 10, "window-seconds": 60},
+    }
+
+
+@pytest.mark.parametrize("quota, match", [
+    ("    - monthly-limit: 80", "unknown keys: monthly-limit"),
+    ("    - balance-cap: -1", "balance-cap"),
+    ("    - max-active-reservations: 1.5", "max-active-reservations"),
+    ("    - pool-concurrency:\n        rpi5: 0", "pool-concurrency rpi5"),
+    ("    - reserve-rate:\n        requests: 10", "window-seconds"),
+])
+def test_load_clients_rejects_a_bad_quota(tmp_path, quota, match):
+    _write_client_yaml(tmp_path / "clients", f"  quota:\n{quota}")
+
+    with pytest.raises(ValueError, match=match):
+        server_mod._load_clients(tmp_path)
+
+
+def test_load_clients_rejects_one_account_with_two_quotas(tmp_path):
+    clients_dir = tmp_path / "clients"
+    _write_client_yaml(clients_dir, """  account-id: team
+  quota:
+    - balance-cap: 10""")
+    (clients_dir / "client-02.yml").write_text("""
+- name: client-02
+  key: client-key-02
+  account-id: team
+""")
+
+    with pytest.raises(ValueError, match="account team"):
+        server_mod._load_clients(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Accounting of reservations
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def accounting_on(tmp_path, monkeypatch):
+    """Accounting on, rpi5 at cost 2; a new account opens with 10."""
+    conf = server_mod._normalize_accounting(
+        [{"enabled": True}, {"pool-costs": {"rpi5": 2}},
+         {"database": str(tmp_path / "accounting.sqlite3")}], tmp_path)
+    store = server_mod._open_store(conf)
+    monkeypatch.setattr(server_mod, "accounting_conf", conf)
+    monkeypatch.setattr(server_mod, "accounting_store", store)
+    return store
+
+
+def _one_shared_dut_setup():
+    """client-01 and one DUT in both rpi4 and rpi5."""
+    client = _make_client()
+    node = {"name": "node-01", "ssh": {"ip": "192.0.2.20"},
+            "duts": [_make_pool_dut("dut-01", ["rpi4", "rpi5"])]}
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+    return client
+
+
+def _reserve_json(flask_client, client, pool="rpi5"):
+    return flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": pool},
+    ).get_json()
+
+
+def test_reserve_answers_as_before_with_accounting_off(flask_client,
+                                                       monkeypatch):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+
+    assert set(_reserve_json(flask_client, client)) == {
+        "status", "token", "dut-name", "ip", "ssh-port", "tunnel-ssh-port",
+        "client-ssh-overrides"}
+
+
+@pytest.mark.parametrize("pool, charged", [("rpi4", 1.0), ("rpi5", 2.0)])
+def test_reserve_charges_the_pool_asked_for(flask_client, monkeypatch,
+                                            accounting_on, pool, charged):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+
+    data = _reserve_json(flask_client, client, pool)
+
+    assert data["status"] == 0
+    assert data["account-id"] == "client-01"
+    assert data["charged-tokens"] == charged
+    assert data["tokens-available"] == 10 - charged
+    assert data["valid-until"] == server_mod.reserves[0]["valid-until"]
+
+
+def test_reserve_gives_the_charge_back_when_the_tunnel_fails(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+
+    def failing_tunnel(*args):
+        raise OSError("no ssh")
+
+    monkeypatch.setattr(server_mod, "_start_ssh_tunnel", failing_tunnel)
+
+    assert _reserve_json(flask_client, client)["status"] == -99
+
+    assert server_mod.reserves == []
+    kinds = [r["kind"] for r in accounting_on.history("client-01")]
+    assert kinds == ["reserve-rollback", "charge", "recharge"]
+
+
+def test_lease_refunds_an_early_release_once(flask_client, monkeypatch,
+                                             accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client)["token"]
+
+    for _ in range(2):
+        flask_client.post(
+            "/lease", json={"client-key": client["key"], "token": token})
+
+    refunds = accounting_on.history("client-01", kind="refund")
+    assert len(refunds) == 1
+    # Released at once: 119 or 120 of the 120 minutes come back.
+    assert refunds[0]["amount_millitokens"] >= 2000 * 119 // 120
+
+
+def test_account_policy_puts_the_quota_over_the_defaults(accounting_on):
+    default = server_mod._account_policy(_make_client())
+    own = server_mod._account_policy(
+        dict(_make_client(), quota={"monthly-token-limit": 80}))
+
+    assert (default.monthly_limit, default.balance_cap) == (40000, 40000)
+    assert (own.monthly_limit, own.balance_cap) == (80000, 80000)
+    assert own.weekly_recharge == 10000
+
+
+def test_open_store_keeps_the_store_of_the_same_file(accounting_on,
+                                                     tmp_path):
+    conf = server_mod.accounting_conf
+
+    assert server_mod._open_store(conf) is accounting_on
+    assert server_mod._open_store(dict(conf, enabled=False)) is None
+    other = dict(conf, database=str(tmp_path / "other.sqlite3"))
+    assert server_mod._open_store(other).path == other["database"]
+
+
+# ---------------------------------------------------------------------------
+# /account and /account/history
+# ---------------------------------------------------------------------------
+
+def test_account_says_accounting_is_off(flask_client):
+    client = _one_shared_dut_setup()
+
+    for path in ("/account", "/account/history"):
+        data = flask_client.post(
+            path, json={"client-key": client["key"]}).get_json()
+        assert data == {"status": -10, "error": "accounting is off"}
+
+
+def test_account_reports_the_balance_and_the_next_recharge(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    _reserve_json(flask_client, client)
+
+    data = flask_client.post(
+        "/account", json={"client-key": client["key"]}).get_json()
+
+    assert data["status"] == 0
+    assert data["account-id"] == "client-01"
+    assert data["tokens-available"] == 8.0
+    assert data["monthly-token-limit"] == 40.0
+    assert data["active-reservations"] == 1
+    assert data["next-recharge-at"] > int(time.time())
+    assert data["next-recharge-at-iso"].endswith("Z")
+
+
+def test_account_counts_the_reservations_of_every_client_of_the_account(
+        flask_client, monkeypatch, accounting_on):
+    old = dict(_make_client(), **{"account-id": "team"})
+    new = dict(_make_client(name="client-02", key="client-key-02"),
+               **{"account-id": "team"})
+    node = {"name": "node-01", "ssh": {"ip": "192.0.2.20"},
+            "duts": [_make_pool_dut("dut-01", "rpi5")]}
+    with server_mod.state_lock:
+        server_mod.clients[:] = [old, new]
+        server_mod.nodes[:] = [node]
+    _record_tunnels(monkeypatch)
+    _reserve_json(flask_client, old)
+
+    data = flask_client.post(
+        "/account", json={"client-key": new["key"]}).get_json()
+
+    assert (data["account-id"], data["active-reservations"]) == ("team", 1)
+    assert data["tokens-available"] == 8.0
+
+
+def test_account_history_pages_without_the_token_hash(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client)["token"]
+    flask_client.post(
+        "/lease", json={"client-key": client["key"], "token": token})
+
+    def page(**filters):
+        return flask_client.post(
+            "/account/history",
+            json={"client-key": client["key"], **filters}).get_json()
+
+    first = page(limit=2)
+    assert [e["kind"] for e in first["entries"]] == ["refund", "charge"]
+    assert "reservation_token_hash" not in first["entries"][0]
+    rest = page(limit=2, before=first["next-before"])
+    assert [e["kind"] for e in rest["entries"]] == ["recharge"]
+    assert rest["next-before"] is None
+    assert page(kind="charge")["entries"][0]["pool"] == "rpi5"
+
+
+def test_account_history_rejects_a_bad_filter(flask_client, accounting_on):
+    client = _one_shared_dut_setup()
+
+    data = flask_client.post(
+        "/account/history",
+        json={"client-key": client["key"], "since": "yesterday"}).get_json()
+
+    assert data["status"] == -99
+    assert "since" in data["error"]
+
+
+def test_pools_shows_the_price_of_each_pool(flask_client, accounting_on):
+    client = _one_shared_dut_setup()
+    server_mod.accounting_conf["pool-costs"]["rpi4"] = 12
+
+    data = flask_client.post(
+        "/pools", json={"client-key": client["key"]}).get_json()
+
+    # A new account holds 10 tokens: rpi5 at 2 fits, rpi4 at 12 does not.
+    assert [(p["name"], p["token-cost"], p["reservation-tokens"],
+             p["affordable"]) for p in data["pools"]] == [
+        ("rpi4", 12, 12.0, False), ("rpi5", 2, 2.0, True)]
+    assert data["pools"][0]["reservation-minutes"] == 120
+    assert data["pools"][0]["free-duts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Quota gate of /reserve
+# ---------------------------------------------------------------------------
+
+def _quota_setup(monkeypatch, quota=None, duts=1, pool_cost=2):
+    """client-01 with a quota, DUTs in rpi5, tunnels recorded."""
+    client = _make_client()
+    if quota is not None:
+        client["quota"] = quota
+    node = {"name": "node-01", "ssh": {"ip": "192.0.2.20"},
+            "duts": [_make_pool_dut(f"dut-{i:02}", ["rpi5", "rpi5-fast"])
+                     for i in range(1, duts + 1)]}
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+    server_mod.accounting_conf["pool-costs"]["rpi5"] = pool_cost
+    monkeypatch.setattr(server_mod, "reserve_attempts", {})
+    _record_tunnels(monkeypatch)
+    return client
+
+
+@pytest.mark.parametrize("mode, quota, status, warning", [
+    ("observe", None, 0, None),
+    ("warn", None, 0, ["quota_exceeded"]),
+    ("reject", None, -6, None),
+    ("reject", {"enabled": False}, 0, None),
+], ids=["observe", "warn", "reject", "reject-exempt"])
+def test_reserve_short_of_tokens_by_enforcement_mode(
+        flask_client, monkeypatch, accounting_on, mode, quota, status,
+        warning):
+    server_mod.accounting_conf["enforcement"] = mode
+    # A new account holds 10 tokens; one reservation costs 12.
+    client = _quota_setup(monkeypatch, quota, pool_cost=12)
+
+    data = _reserve_json(flask_client, client)
+
+    assert data["status"] == status
+    assert data.get("quota-warning") == warning
+    if status == 0:
+        assert data["tokens-available"] == -2.0
+    else:
+        assert data["error-code"] == "quota_exceeded"
+        assert (data["tokens-required"], data["tokens-available"]) == \
+            (12.0, 10.0)
+        assert data["next-recharge-at-iso"].endswith("Z")
+        assert server_mod.reserves == []
+        assert accounting_on.history("client-01", kind="charge") == []
+
+
+def test_reserve_refuses_past_the_active_reservations(
+        flask_client, monkeypatch, accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    client = _quota_setup(monkeypatch, {"max-active-reservations": 1},
+                          duts=2)
+
+    assert _reserve_json(flask_client, client)["status"] == 0
+    data = _reserve_json(flask_client, client)
+
+    assert (data["status"], data["error-code"]) == (-8, "concurrency_limit")
+
+
+def test_reserve_refuses_past_the_pool_concurrency(
+        flask_client, monkeypatch, accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    client = _quota_setup(monkeypatch, {"pool-concurrency": {"rpi5-fast": 1}},
+                          duts=3)
+
+    # The DUT reserved through rpi5 also counts in rpi5-fast.
+    assert _reserve_json(flask_client, client, "rpi5")["status"] == 0
+    assert _reserve_json(flask_client, client, "rpi5-fast")["status"] == -8
+    assert _reserve_json(flask_client, client, "rpi5")["status"] == 0
+
+
+def test_reserve_refuses_too_many_calls_until_the_window_moves(
+        flask_client, monkeypatch, accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    client = _quota_setup(
+        monkeypatch, {"reserve-rate": {"requests": 2, "window-seconds": 60}})
+    now = int(time.time())
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: now)
+
+    # Both calls count, though the second finds the pool busy.
+    assert [_reserve_json(flask_client, client)["status"]
+            for _ in range(2)] == [0, -4]
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: now + 20)
+    data = _reserve_json(flask_client, client)
+    assert (data["status"], data["retry-after"]) == (-9, 40)
+
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: now + 61)
+    assert _reserve_json(flask_client, client)["status"] == -4
+
+
+def test_reserve_concurrent_calls_share_the_balance(monkeypatch,
+                                                    accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    # Two free DUTs, 10 tokens, 6 a reservation: only one fits.
+    client = _quota_setup(monkeypatch, duts=2, pool_cost=6)
+
+    # Hold both calls once the balance looked good to them. With the
+    # lock, the second one waits for the first and the barrier times
+    # out; without it, both go on and both are charged.
+    barrier = threading.Barrier(2, timeout=0.5)
+    balance_problem = server_mod._balance_problem
+
+    def slow_balance_problem(*args):
+        problem = balance_problem(*args)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return problem
+
+    monkeypatch.setattr(server_mod, "_balance_problem", slow_balance_problem)
+
+    def post(_):
+        return _reserve_json(server_mod.server.test_client(), client)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = sorted(r["status"] for r in pool.map(post, range(2)))
+
+    assert statuses == [-6, 0]
+
+
+# ---------------------------------------------------------------------------
+# /conf/account/...
+# ---------------------------------------------------------------------------
+
+ACCOUNT_ADMIN_PATHS = ["/conf/account/info", "/conf/account/recharge",
+                       "/conf/account/set-balance", "/conf/account/ledger",
+                       "/conf/account/report", "/conf/account/activity"]
+
+
+@pytest.fixture
+def admin_key(monkeypatch):
+    monkeypatch.setattr(server_mod, "admin_key", "the-admin-key")
+    return "the-admin-key"
+
+
+def _admin(flask_client, path, admin_key, **body):
+    return flask_client.post(path, json={"admin-key": admin_key, **body})
+
+
+@pytest.mark.parametrize("path", ACCOUNT_ADMIN_PATHS)
+def test_account_admin_needs_the_key_and_accounting(flask_client, admin_key,
+                                                    path):
+    assert _admin(flask_client, path, "wrong").status_code == 403
+    assert _admin(flask_client, path, admin_key).get_json() == {
+        "result": -10, "error": "accounting is off"}
+
+
+def test_admin_recharge_needs_a_reason_and_applies_once(
+        flask_client, admin_key, accounting_on):
+    _one_shared_dut_setup()
+    body = {"client": "client-01", "tokens": 5, "idempotency-key": "k1"}
+
+    data = _admin(flask_client, "/conf/account/recharge", admin_key,
+                  **body).get_json()
+    assert (data["result"], data["error"]) == (-2, "reason missing")
+
+    for _ in range(2):
+        data = _admin(flask_client, "/conf/account/recharge", admin_key,
+                      reason="demo", **body).get_json()
+    assert (data["result"], data["tokens-available"]) == (0, 15.0)
+
+
+def test_admin_set_balance_takes_no_negative(flask_client, admin_key,
+                                             accounting_on):
+    _one_shared_dut_setup()
+    body = {"client": "client-01", "reason": "reset"}
+
+    data = _admin(flask_client, "/conf/account/set-balance", admin_key,
+                  tokens=-1, **{"idempotency-key": "k1"}, **body).get_json()
+    assert data["result"] == -2
+
+    data = _admin(flask_client, "/conf/account/set-balance", admin_key,
+                  tokens=3, **{"idempotency-key": "k2"}, **body).get_json()
+    assert (data["result"], data["tokens-available"]) == (0, 3.0)
+
+
+def test_admin_info_and_ledger_name_the_account_by_a_client(
+        flask_client, monkeypatch, admin_key, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    _reserve_json(flask_client, client)
+
+    info = _admin(flask_client, "/conf/account/info", admin_key,
+                  client="client-01").get_json()
+    assert (info["clients"], info["enforcement"]) == (["client-01"],
+                                                      "observe")
+    ledger = _admin(flask_client, "/conf/account/ledger", admin_key,
+                    client="client-01", kind="charge").get_json()
+    assert [e["pool"] for e in ledger["entries"]] == ["rpi5"]
+    assert _admin(flask_client, "/conf/account/ledger", admin_key,
+                  client="nobody").get_json()["result"] == -1
+
+
+def test_admin_report_adds_up_the_ledger(flask_client, monkeypatch,
+                                         admin_key, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    now = int(time.time())
+    for second in range(2):
+        # A released DUT stays taken for the rest of that second.
+        monkeypatch.setattr(server_mod, "_now_epoch",
+                            lambda: now + second)
+        token = _reserve_json(flask_client, client)["token"]
+        flask_client.post("/lease", json={"client-key": client["key"],
+                                          "token": token})
+
+    data = _admin(flask_client, "/conf/account/report", admin_key,
+                  client="client-01", pool="rpi5").get_json()
+
+    assert [(r["kind"], r["entries"], r["tokens"], r["minutes"])
+            for r in data["rows"] if r["kind"] == "charge"] == \
+        [("charge", 2, -4.0, 240)]
+
+
+# ---------------------------------------------------------------------------
+# Audit of power, flash and wipe
+# ---------------------------------------------------------------------------
+
+def _activity(store):
+    """Every activity row, oldest first, as dicts."""
+    conn = store._connect()
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM activity_events ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def test_power_is_logged_with_the_pool_of_the_charge(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client, "rpi4")["token"]
+    monkeypatch.setattr(server_mod, "_power_action_error", lambda *a: None)
+
+    flask_client.post("/power/cycle", json={"token": token})
+
+    [row] = _activity(accounting_on)
+    assert (row["account_id"], row["action"], row["pool"], row["dut_name"],
+            row["result"]) == ("client-01", "power", "rpi4", "dut-01",
+                               "success")
+    assert json.loads(row["metadata_json"]) == {"action": "cycle"}
+
+
+def test_flash_logs_both_modes_alike_and_no_path_or_token(
+        flask_client, monkeypatch, accounting_on):
+    _, _, token = _reserved_dut(token="token-audit-flash")
+    monkeypatch.setattr(server_mod, "_flash_image", lambda *a: None)
+    monkeypatch.setattr(server_mod, "_push_and_flash", lambda *a: None)
+
+    flask_client.post("/flash", json={"token": token,
+                                      "path": "/home/me/secret/rpi5.wic"})
+    flask_client.post(
+        "/flash",
+        data={"token": token, "image": (io.BytesIO(b"x"), "rpi5.wic")},
+        content_type="multipart/form-data")
+
+    rows = _activity(accounting_on)
+    assert [json.loads(r["metadata_json"]) for r in rows] == [
+        {"mode": "named", "image-name": "rpi5.wic"},
+        {"mode": "upload", "image-name": "rpi5.wic", "bmap": False}]
+    assert {r["result"] for r in rows} == {"success"}
+    assert {tuple(r) for r in rows} == {tuple(rows[0])}
+    stored = json.dumps(rows)
+    assert token not in stored and "secret" not in stored
+
+
+def test_wipe_logs_a_failure_without_its_path(flask_client, monkeypatch,
+                                              accounting_on):
+    _, _, token = _reserved_dut(token="token-audit-wipe")
+
+    def fake_wipe(node, dut, size_bytes):
+        raise OSError("[Errno 2] No such file: '/var/tmp/x'")
+
+    monkeypatch.setattr(server_mod, "_wipe_storage", fake_wipe)
+
+    flask_client.post("/wipe", json={"token": token, "size": 1024})
+
+    [row] = _activity(accounting_on)
+    assert (row["action"], row["result"], row["error"]) == (
+        "wipe", "failed", "[Errno 2] No such file")
+    assert json.loads(row["metadata_json"]) == {"size-bytes": 1024}
+
+
+def test_dut_status_is_not_logged(flask_client, monkeypatch, accounting_on):
+    _, _, token = _reserved_dut(token="token-audit-status")
+    monkeypatch.setattr(server_mod, "_ping_host", lambda *a, **k: True)
+    monkeypatch.setattr(server_mod, "_check_ssh", lambda *a, **k: True)
+
+    flask_client.post("/dut/status", json={"token": token})
+
+    assert _activity(accounting_on) == []
+
+
+def test_admin_activity_lists_the_logged_calls(flask_client, monkeypatch,
+                                               admin_key, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client)["token"]
+    errors = iter([None, "power script failed"])
+    monkeypatch.setattr(server_mod, "_power_action_error",
+                        lambda *a: next(errors))
+    monkeypatch.setattr(server_mod, "_wipe_storage", lambda *a: None)
+    for path in ("/power/on", "/power/off", "/wipe"):
+        flask_client.post(path, json={"token": token})
+
+    def page(**body):
+        return _admin(flask_client, "/conf/account/activity", admin_key,
+                      **body).get_json()
+
+    first = page(client="client-01", action="power", limit=1)
+    [event] = first["events"]
+    assert (event["action"], event["pool"], event["result"],
+            event["error"], event["metadata"]) == (
+        "power", "rpi5", "failed", "power script failed",
+        {"action": "off"})
+    assert "reservation_token_hash" not in event
+    rest = page(action="power", before=first["next-before"])
+    assert [e["metadata"] for e in rest["events"]] == [{"action": "on"}]
+    assert rest["next-before"] is None
+    assert [e["action"] for e in page()["events"]] == ["wipe", "power",
+                                                       "power"]
+    assert page(client="nobody")["result"] == -1
+    assert page(since="today")["result"] == -2
+
+
+# ---------------------------------------------------------------------------
+# Pool costs of shared DUTs
+# ---------------------------------------------------------------------------
+
+def _shared_dut_nodes():
+    return [{"name": "node-01", "ssh": {},
+             "duts": [_make_pool_dut("dut-01", ["rpi5", "rpi5-fast"]),
+                      _make_pool_dut("dut-02", "rpi5")]}]
+
+
+def test_a_dut_in_pools_of_different_costs_is_warned_about(caplog):
+    conf = server_mod._normalize_accounting(
+        [{"enabled": True}, {"pool-costs": {"rpi5-fast": 3}}], Path("."))
+
+    server_mod._check_pool_costs(conf, _shared_dut_nodes())
+
+    assert "dut-01 (rpi5=1, rpi5-fast=3)" in caplog.text
+    assert "dut-02" not in caplog.text
+    caplog.clear()
+    server_mod._check_pool_costs(dict(conf, enabled=False),
+                                 _shared_dut_nodes())
+    assert caplog.text == ""
+
+
+def test_a_strict_reload_refuses_mixed_costs_and_keeps_the_old_config(
+        tmp_path, monkeypatch):
+    (tmp_path / "conf.yml").write_text(f"""---
+admin-key: new-key
+accounting:
+  - enabled: true
+  - strict-pool-costs: true
+  - database: {tmp_path / "accounting.sqlite3"}
+  - pool-costs:
+      rpi5-fast: 3
+""")
+    (tmp_path / "nodes").mkdir()
+    (tmp_path / "nodes" / "node-01.yml").write_text("""
+- name: node-01
+  duts:
+    - name: dut-01
+      metadata:
+        - pools: [rpi5, rpi5-fast]
+""")
+    monkeypatch.setattr(server_mod, "CONFIG_DIR", tmp_path)
+    old_key = server_mod.admin_key
+
+    with pytest.raises(ValueError, match="dut-01"):
+        server_mod.reload_config()
+
+    assert server_mod.admin_key == old_key
+    assert not (tmp_path / "accounting.sqlite3").exists()

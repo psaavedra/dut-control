@@ -80,8 +80,9 @@ def test_ssh_override_payload_rejects_bad_port(monkeypatch, capsys, value):
 class FakeResponse:
     """Enough of requests.Response for the subcommands."""
 
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self.payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
         pass
@@ -505,3 +506,139 @@ def test_flash_upload_of_something_that_is_not_a_file(capsys, tmp_path):
 
     assert exit_info.value.code == 1
     assert "is not a file" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# account and account-history
+# ---------------------------------------------------------------------------
+
+ACCOUNT = {
+    "status": 0,
+    "account-id": "team-browser",
+    "tokens-available": 31.5,
+    "monthly-token-limit": 80.0,
+    "period-granted": 40.0,
+    "next-recharge-at": 1790630400,
+    "next-recharge-at-iso": "2026-09-28T00:00:00Z",
+    "next-recharge-tokens": 20.0,
+    "active-reservations": 1,
+}
+
+HISTORY = {
+    "status": 0,
+    "account-id": "team-browser",
+    "entries": [
+        {"id": 7, "ts": 1790600000, "ts-iso": "2026-09-27T15:33:20Z",
+         "kind": "charge", "tokens": -2.0, "balance-after": 31.5,
+         "pool": "rpi5", "dut-name": "rpi5-01", "minutes": 120,
+         "actor": "client-01", "reason": None},
+    ],
+    "next-before": 7,
+}
+
+
+def test_account_prints_the_balance_and_the_next_recharge(answers, capsys):
+    calls = answers(ACCOUNT)
+
+    assert client_mod.main(["account"]) == 0
+
+    assert calls[0][0].endswith("/account")
+    out = capsys.readouterr().out
+    assert "tokens-available: 31.5" in out
+    assert "next-recharge: 20 at 2026-09-28T00:00:00Z" in out
+
+
+def test_account_prints_one_json_object(answers, capsys):
+    answers(ACCOUNT)
+
+    assert client_mod.main(["account", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == ACCOUNT
+
+
+def test_account_on_a_server_without_accounting(monkeypatch, capsys):
+    monkeypatch.setattr(client_mod.requests, "post",
+                        lambda *a, **k: FakeResponse(None, status_code=404))
+    monkeypatch.setenv(client_mod.CLIENT_KEY_ENV, "a-client-key")
+
+    with pytest.raises(SystemExit) as excinfo:
+        client_mod.main(["account"])
+
+    assert excinfo.value.code == client_mod.NO_ACCOUNTING_EXIT
+    assert "does not support accounting" in capsys.readouterr().err
+
+
+def test_account_history_sends_only_the_filters_given(answers, capsys):
+    calls = answers(HISTORY)
+
+    assert client_mod.main(["account-history", "--since", "2026-09-01",
+                            "--kind", "charge"]) == 0
+
+    url, payload, _ = calls[0]
+    assert url.endswith("/account/history")
+    assert payload == {"client-key": "a-client-key", "since": 1788220800,
+                       "kind": "charge"}
+    out, err = capsys.readouterr()
+    assert "charge" in out and "-2" in out and "rpi5-01" in out
+    assert "--before 7" in err
+
+
+@pytest.mark.parametrize("given", [
+    "1788220800", "2026-09-01", "2026-09-01T00:00:00Z",
+    "2026-09-01T02:00:00+02:00",
+])
+def test_a_time_is_an_epoch_or_iso_8601_in_utc(given):
+    assert client_mod._epoch(given) == 1788220800
+
+
+def test_a_time_that_is_not_a_time_is_refused():
+    with pytest.raises(client_mod.argparse.ArgumentTypeError):
+        client_mod._epoch("yesterday")
+
+
+def test_pools_prints_one_json_object(answers, capsys):
+    listing = {"status": 0, "pools": [
+        {"name": "rpi5", "enabled-duts": 3, "free-duts": 1,
+         "token-cost": 2, "reservation-tokens": 2.0, "affordable": True}]}
+    answers(listing)
+
+    assert client_mod.main(["pools", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == listing
+
+
+QUOTA_EXCEEDED = {
+    "status": -6, "error": "quota exceeded", "error-code": "quota_exceeded",
+    "tokens-required": 3.0, "tokens-available": 1.5,
+    "next-recharge-at": 1790630400,
+    "next-recharge-at-iso": "2026-09-29T00:00:00Z",
+    "next-recharge-tokens": 10.0,
+}
+CONCURRENCY = {"status": -8, "error": "too many active reservations",
+               "error-code": "concurrency_limit"}
+RATE_LIMITED = {"status": -9, "error": "too many reserve calls",
+                "error-code": "rate_limited", "retry-after": 40}
+
+
+@pytest.mark.parametrize("refusal", [QUOTA_EXCEEDED, CONCURRENCY,
+                                     RATE_LIMITED],
+                         ids=["quota", "concurrency", "rate"])
+def test_a_quota_refusal_is_not_waited_out(replies, refusal):
+    calls, waits = replies(refusal, RESERVATION)
+
+    with pytest.raises(SystemExit):
+        client_mod.main(["reserve", "rpi5", "--retries", "5"])
+
+    assert len(calls) == 1
+    assert waits == []
+
+
+def test_a_quota_refusal_says_when_it_clears(replies, capsys):
+    replies(QUOTA_EXCEEDED)
+
+    with pytest.raises(SystemExit):
+        client_mod.main(["reserve", "rpi5"])
+
+    err = capsys.readouterr().err
+    assert "needs 3 tokens, has 1.5" in err
+    assert "next recharge of 10 at 2026-09-29T00:00:00Z" in err

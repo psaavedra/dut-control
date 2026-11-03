@@ -110,6 +110,46 @@ max-upload-bytes: 8589934592
 
 The value of `admin-key` must be provided by admin clients when calling admin endpoints.
 
+#### Accounting
+
+An optional `accounting` section gives each account a budget of tokens. Tokens pay for reserved time, and a pool can cost more than another:
+
+```yaml
+accounting:
+  - enabled: true
+  - enforcement: observe
+  - token-minutes: 120
+  - default-monthly-token-limit: 40
+  - default-weekly-recharge-tokens: 10
+  - default-balance-cap: 40
+  - recharge-weekday: 1
+  - recharge-hour-utc: 0
+  - database: /var/lib/dut-control/accounting.sqlite3
+  - pool-costs:
+      rpi4: 1
+      rpi5: 2
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turn accounting on. Without the section, or with `false`, nothing changes. |
+| `enforcement` | `observe` | `observe` only records, `warn` lets a reservation through with a warning, `reject` refuses it. |
+| `token-minutes` | `120` | Minutes of reservation that one token pays for in a pool of cost 1. |
+| `default-monthly-token-limit` | `40` | Most tokens the weekly recharges give in one calendar month (UTC). |
+| `default-weekly-recharge-tokens` | `10` | Tokens added at each weekly recharge. |
+| `default-balance-cap` | the monthly limit of the account | Most tokens an account can hold. |
+| `recharge-weekday` | `1` | ISO day of the recharge, 1 (Monday) to 7 (Sunday). |
+| `recharge-hour-utc` | `0` | Hour of the recharge, 0 to 23, in UTC. |
+| `database` | `accounting.sqlite3` in `DUT_CONTROL_STATE_DIR`, else in the config directory | Where the balances and the history are kept. |
+| `pool-costs` | `{}` | Cost of each pool; a pool not listed costs 1. A reservation of 120 minutes in a pool of cost 2 takes 2 tokens. |
+| `strict-pool-costs` | `false` | Refuse a configuration where one DUT sits in pools of different costs, instead of only logging a warning. |
+
+A reservation is priced by the pool it is asked through, so a DUT in a cheap pool and in an expensive one can be had at the cheap price. On load and on `/conf/reload`, the service logs a warning that names each such DUT with its pools and their costs, e.g. `dut-01 (rpi5=1, rpi5-fast=3)`. With `strict-pool-costs: true` the configuration fails to load instead, and a reload keeps the one already running. Use [`allowed-pools`](#client-configuration) to keep a client out of the cheap pool when the difference is on purpose.
+
+The `default-*` values apply to every client without its own `quota`; see [Client configuration](#client-configuration). An unknown key or a bad value (a negative number, `token-minutes: 0`, a cost of 0, `recharge-hour-utc: 24`) makes the configuration fail to load, since a typo here would change what a team may spend.
+
+With accounting on, `/power`, `/flash` and `/wipe` also log each call on a valid reservation to the `activity_events` table of the database, success or failure. They cost no tokens. A row has the account, the pool and DUT of the reservation, the result and, for a failure, the error cut at its first colon, so a path that follows it is not kept. The metadata is `action` for `/power`; `mode` (`named` or `upload`), the bare `image-name` and, for an upload, `bmap` for `/flash`; `size-bytes` for `/wipe`. Neither the reservation token nor an image path is stored. `/dut/status` is not logged, so `wait` adds nothing. Read the log with [`/conf/account/activity`](#admin-accounts) or `dut-control-admin account-activity`.
+
 ### Client configuration
 
 Clients are defined under `clients/*.yml`.
@@ -149,6 +189,35 @@ An optional `allowed-pools` list restricts which pools a client can list and res
 A client without the key, like `client-01` above, reaches every pool, so configurations written before the key keep working; `allowed-pools: []` denies every pool. The value must be a YAML list of pool names, and a scalar, a mapping, an empty entry or a bare `yes` (which YAML reads as a boolean) makes the configuration fail to load rather than quietly changing who can reach what. Repeated names are dropped. A name is not checked against the configured pools, since a pool may be added, removed or disabled later without making the policy invalid; a permitted pool that does not exist simply never shows up.
 
 The policy covers discovery and new reservations only: a reservation already handed out survives a `/conf/reload` that drops its pool, so its token can still be used and released. `/conf/info/clients` reports `allowed-pools` for the clients that have one.
+
+Two optional keys tie a client to the [accounting](#accounting) budget:
+
+```yaml
+- name: client-03
+  key: 0c5e7a1d9f2b4863
+  account-id: team-browser
+  ssh:
+    - ip: 192.168.1.248
+    - user: ci
+  ports-range:
+    - from: 5200
+    - to: 5210
+  quota:
+    - enabled: true
+    - monthly-token-limit: 80
+    - weekly-recharge-tokens: 20
+    - balance-cap: 80
+    - max-active-reservations: 2
+    - pool-concurrency:
+        rpi5-fast: 1
+    - reserve-rate:
+        - requests: 10
+        - window-seconds: 60
+```
+
+`account-id` names the account the client spends from; it defaults to the client `name`. The history is kept by account, so a new `key` with the same `account-id` keeps it. Two clients can share an account, for example the old and the new key during a rotation, but then they must have the same `quota`.
+
+`quota` overrides the defaults of `conf.yml` for that account. `monthly-token-limit`, `weekly-recharge-tokens` and `balance-cap` take the place of the `default-*` keys. `max-active-reservations` caps the reservations held at the same time, and `pool-concurrency` does the same per pool. `reserve-rate` caps the `/reserve` calls in a time window. `enabled: false` makes the account exempt: its use is still recorded but never refused. As for `allowed-pools`, a bad value makes the configuration fail to load. `/conf/info/clients` shows both keys for the clients that have them.
 
 `ssh.ip` and `ssh.port` are the address the service uses to reach the client back (reverse tunnel and image `scp`). A client that is not reachable at that address, typically because it sits behind NAT and only knows its public address and forwarded port at run time, can announce the right values on each request; see [Client SSH overrides](#client-ssh-overrides). Such a client still needs an `ssh` section in its YAML entry, if only for `user`; the announced values replace the configured ones in memory.
 
@@ -297,6 +366,22 @@ List the pools a client can reserve from, with their DUT counts.
 
 `enabled-duts` counts the DUTs in the pool that are enabled; `free-duts` counts those of them without an unexpired reservation, so it is what `/reserve` could currently hand out. A DUT in several pools is counted in each of them. Pools are sorted by name, and a pool whose DUTs are all disabled is omitted, since it cannot be reserved from at all. The listing is limited to the pools the client is allowed to use, so a client whose `allowed-pools` is empty gets `{"status": 0, "pools": []}`; see [Client configuration](#client-configuration).
 
+With [accounting](#accounting) on, each pool also says what a reservation in it costs, and whether the balance of the client's account covers it:
+
+```json
+{
+  "name": "rpi5",
+  "enabled-duts": 3,
+  "free-duts": 1,
+  "token-cost": 2,
+  "reservation-minutes": 120,
+  "reservation-tokens": 2.0,
+  "affordable": true
+}
+```
+
+`token-cost` is the cost of the pool in `pool-costs`, and `reservation-tokens` what one reservation of `reservation-minutes` takes from the balance. The call applies the recharges that are due before it compares.
+
 Missing or invalid `client-key` returns `status = -1`; an invalid SSH override returns `status = -5` (see [Client SSH overrides](#client-ssh-overrides)).
 
 ### Reservation: /reserve
@@ -333,6 +418,44 @@ On success, the service:
 
 `client-ssh-overrides` echoes back the SSH fields of the client that are currently overridden, and is an empty list for a client using its configured address.
 
+With [accounting](#accounting) on, the reservation is charged to the account of the client and the answer has four more keys:
+
+```json
+{
+  "account-id": "team-browser",
+  "charged-tokens": 2.0,
+  "tokens-available": 8.0,
+  "valid-until": 1790623200
+}
+```
+
+The price is set by the pool in the request, not by the other pools of the DUT, so a DUT in a cheap pool and an expensive pool costs the price of the pool in the request. If the SSH tunnel does not start, the reservation is dropped and the whole charge goes back.
+
+Before it picks a DUT, `/reserve` checks the quota of the account, in this order: the `reserve-rate` of the client, its `max-active-reservations` and `pool-concurrency`, then the balance against the price. What happens when a check fails depends on `enforcement`:
+
+| `enforcement` | Result |
+|---|---|
+| `observe` | The reservation goes through; the balance can go below zero. |
+| `warn` | The same, and the answer lists the failed checks: `"quota-warning": ["quota_exceeded"]`. |
+| `reject` | The reservation is refused with the first failed check, and nothing is charged. |
+
+An account with `quota.enabled: false` is always in `observe`. `pool-concurrency` counts the reservations of the account on the DUTs of the pool, so a DUT reserved through another pool it belongs to counts too. A `/reserve` call counts toward `reserve-rate` whatever its result, except a call refused for the rate itself, so a client that waits gets through.
+
+A refusal carries an `error-code` for scripts. For lack of tokens it also says when that clears:
+
+```json
+{
+  "status": -6,
+  "error": "quota exceeded",
+  "error-code": "quota_exceeded",
+  "tokens-required": 3.0,
+  "tokens-available": 1.5,
+  "next-recharge-at": 1790640000,
+  "next-recharge-at-iso": "2026-09-29T00:00:00Z",
+  "next-recharge-tokens": 10.0
+}
+```
+
 **Error responses** use HTTP 200 with a JSON body containing `status` and `error`:
 
 - `status = -1`: missing or invalid `client-key`
@@ -340,7 +463,10 @@ On success, the service:
 - `status = -3`: pool exists but is empty
 - `status = -4`: all DUTs in pool already reserved or no free ports for client
 - `status = -5`: invalid `client-ssh-ip` or `client-ssh-port`
-- `status = -99`: internal error when starting the SSH tunnel
+- `status = -6`, `error-code = quota_exceeded`: the balance does not cover the reservation; wait for `next-recharge-at` or an admin credit
+- `status = -8`, `error-code = concurrency_limit`: the account holds as many reservations as `max-active-reservations`, or as `pool-concurrency` allows in the pool; release one first
+- `status = -9`, `error-code = rate_limited`: too many `/reserve` calls; `retry-after` says in how many seconds to try again
+- `status = -99`: internal error when starting the SSH tunnel or charging the reservation
 
 ### Lease / release: /lease
 
@@ -360,6 +486,9 @@ On success the service:
 
 - Kills SSH tunnel processes associated with the selected reservations
 - Sets `valid-until` to now for those reservations
+- With [accounting](#accounting) on, gives back the unused whole minutes of each one; a started minute counts as used
+
+A reservation gets one refund at most, however many times it is released. The refund can take the balance over the cap, since these are the account's own tokens, and it does not count toward the monthly limit. A reservation that runs to its end, or one removed by `/conf/reserves/prune`, gets nothing back.
 
 **Success response**:
 
@@ -370,6 +499,86 @@ On success the service:
 If no matching reservations exist, the service still returns `{"status": 0}`.
 
 Internal errors are returned as `{"status": -99, "error": "..."}`.
+
+### Account: /account
+
+The token balance of the client's account and its next recharge. See [Accounting](#accounting).
+
+- **Method**: `POST` (or `PUT`)
+- **Path**: `/account`
+- **Request body**: `client-key` (string, required)
+
+**Success response**:
+
+```json
+{
+  "status": 0,
+  "account-id": "team-browser",
+  "tokens-available": 31.5,
+  "monthly-token-limit": 80.0,
+  "weekly-recharge-tokens": 20.0,
+  "balance-cap": 80.0,
+  "period-start": 1788220800,
+  "period-end": 1790812800,
+  "period-granted": 40.0,
+  "next-recharge-at": 1791158400,
+  "next-recharge-at-iso": "2026-10-05T00:00:00Z",
+  "next-recharge-tokens": 20.0,
+  "active-reservations": 1
+}
+```
+
+The call first applies the recharges that are due. `period-start` and `period-end` bound the calendar month (UTC), and `period-granted` is what the recharges gave in it. `next-recharge-tokens` is what the next recharge will add, after the monthly limit and the cap. `active-reservations` counts the unexpired reservations of every client of the account. Times are epoch seconds.
+
+**Error responses**:
+
+- `status = -1`: missing or invalid `client-key`
+- `status = -10`: accounting is off on this service
+
+A service from before accounting answers with HTTP 404.
+
+### Account history: /account/history
+
+The charges, refunds and recharges of the client's account, newest first.
+
+- **Method**: `POST` (or `PUT`)
+- **Path**: `/account/history`
+- **Request body**:
+  - `client-key` (string, required)
+  - `since`, `until` (integers, optional): only entries from `since` and before `until`, in epoch seconds
+  - `kind` (string, optional): only one kind of entry: `recharge`, `charge`, `refund`, `reserve-rollback` or `admin`
+  - `pool` (string, optional): only entries for that pool
+  - `limit` (integer, optional): entries per page; 100 by default, 1000 at most
+  - `before` (integer, optional): only entries older than this id, to read the next page
+
+**Success response**:
+
+```json
+{
+  "status": 0,
+  "account-id": "team-browser",
+  "entries": [
+    {
+      "id": 7,
+      "ts": 1790600000,
+      "ts-iso": "2026-09-27T15:33:20Z",
+      "kind": "charge",
+      "tokens": -2.0,
+      "balance-after": 31.5,
+      "pool": "rpi5",
+      "dut-name": "rpi5-01",
+      "minutes": 120,
+      "actor": "client-01",
+      "reason": null
+    }
+  ],
+  "next-before": 7
+}
+```
+
+`tokens` is negative for what leaves the balance. A full page sets `next-before` to the id to pass as `before` for the next one; otherwise it is `null`. Entries never hold the reservation token.
+
+**Error responses**: as for `/account`, plus `status = -99` for a filter that is not a non-negative integer.
 
 ### Power control: /power/<on|off|cycle>
 
@@ -536,6 +745,56 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   Enables or disables a DUT at runtime. Body: `dut-name` (string, required) and `enabled` (boolean, required), plus `admin-key`. Returns `{"result": 0, "dut-name": ..., "enabled": ...}` on success, `{"result": -1, "error": ...}` for a missing `dut-name` or non-boolean `enabled`, and `{"result": -2, "error": "dut not found"}` for an unknown DUT.
   Disabled DUTs are excluded from pool lookups so they cannot be reserved; existing reservations keep working. The change is in-memory only: `/conf/reload` or a service restart reverts to the `enabled` value from the YAML configuration.
 
+### Admin: accounts
+
+These endpoints manage the [accounting](#accounting). An account is named by one of its clients, in `client`, since the quota of the account comes from the client configuration. They return `{"result": -10, "error": "accounting is off"}` when accounting is off, and `{"result": -1, "error": "client not found"}` for an unknown client.
+
+- **`POST /conf/account/info`**
+  Body: `client`. Returns what [`/account`](#account-account) returns, plus `enforcement` (the mode that applies to the account) and `clients` (every client of the account).
+
+- **`POST /conf/account/recharge`**
+  Body: `client`, `tokens` (a number; negative takes tokens away), `reason` and `idempotency-key` (both non-empty strings). Adds the tokens and returns the account as `info` does. The same key applies once per account, so a request that timed out can be sent again. An admin credit is not a recharge: it ignores the cap and the monthly limit. A missing field, or a change that would take the balance below zero, returns `result = -2`.
+
+- **`POST /conf/account/set-balance`**
+  As `recharge`, but `tokens` (zero or more) is the new balance. The ledger keeps the difference, with the reason.
+
+- **`POST /conf/account/ledger`**
+  Body: `client`, plus the filters of [`/account/history`](#account-history-accounthistory). Returns the same page; a bad filter returns `result = -2`.
+
+- **`POST /conf/account/report`**
+  Body: `since` and `until` (epoch seconds), `client` and `pool`, all optional. Returns the ledger totals by account, pool and kind:
+
+  ```json
+  {
+    "result": 0,
+    "rows": [
+      {"account-id": "team-browser", "pool": "rpi5", "kind": "charge",
+       "entries": 12, "tokens": -24.0, "minutes": 1440}
+    ]
+  }
+  ```
+
+  `minutes` is the reserved time of the charges. Refunds are in their own row, so the time used is the charged time less what the refunds gave back.
+
+- **`POST /conf/account/activity`**
+  Body: `client` (optional; every account without it), `action` (`power`, `flash` or `wipe`) and `pool`, plus `since`, `until`, `limit` and `before` as for [`/account/history`](#account-history-accounthistory). Returns the logged calls, newest first, paged the same way:
+
+  ```json
+  {
+    "result": 0,
+    "events": [
+      {"id": 42, "ts": 1790600000, "ts-iso": "2026-09-27T15:33:20Z",
+       "account-id": "team-browser", "action": "flash", "pool": "rpi5",
+       "dut-name": "rpi5-01", "result": "failed",
+       "error": "flash command failed on node",
+       "metadata": {"mode": "upload", "image-name": "rpi5.wic", "bmap": true}}
+    ],
+    "next-before": null
+  }
+  ```
+
+  A bad filter returns `result = -2`.
+
 ## CLI tools
 
 ### dut-control-client
@@ -545,7 +804,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 **Environment**:
 
 - `DUT_CONTROL_URL` (optional): base URL of the service (default `http://localhost:8000`)
-- `DUT_CONTROL_CLIENT_KEY` (required for `reserve` and `lease`): client key matching configuration
+- `DUT_CONTROL_CLIENT_KEY` (required for `pools`, `reserve`, `lease`, `account` and `account-history`): client key matching configuration
 - `DUT_CONTROL_TOKEN` (optional): reservation token for `power`, `flash`, `status` and `lease`, used when none is given on the command line. Preferred over the positional argument on a shared host, where a token on a command line is readable in `ps` by every other user and ends up in any log that echoes the command
 - `DUT_CONTROL_CLIENT_SSH_IP` (optional): address the service must use to reach this host back, overriding the `ssh.ip` of its configuration entry
 - `DUT_CONTROL_CLIENT_SSH_PORT` (optional): port to use instead of the configured `ssh.port`
@@ -559,8 +818,8 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 **Subcommands**:
 
-- **`pools`**
-  Calls `/pools` and prints one row per reservable pool with its enabled and free DUT counts:
+- **`pools [--json]`**
+  Calls `/pools` and prints one row per reservable pool with its enabled and free DUT counts (`--json` prints the service response instead, with the token prices when accounting is on):
 
   ```text
   POOL                ENABLED  FREE
@@ -569,7 +828,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   ```
 
 - **`reserve <pool> [--json] [--retries N] [--retries-wait D]`**
-  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change. `--retries` waits out a pool whose DUTs are all taken (`status = -4`). `--retries-wait` is a number of seconds, or carries an `s`, `m` or `h` suffix.
+  Reserves a DUT from the given pool and prints `token`, `dut-name`, `ip`, `ssh-port`, and `tunnel-ssh-port` to stdout, plus a `client-ssh-overrides` line when the service is using an announced address for this host. `--json` prints the service response as one JSON object instead, which is the form to parse from a script: it is the response itself, so a field added to it later needs no client change. `--retries` waits out a pool whose DUTs are all taken (`status = -4`), but not a quota refusal (`-6`, `-8`, `-9`), which no short wait clears; for one of those it prints when the refusal clears (the next recharge, or `retry-after`) on stderr. `--retries-wait` is a number of seconds, or carries an `s`, `m` or `h` suffix.
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
   Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used. Given no filter at all, it releases the reservation named by `DUT_CONTROL_TOKEN` when that is set, and everything the client holds when it is not
@@ -588,6 +847,22 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 - **`wait [token] [--for ping|ssh] [--retries N] [--retries-wait D]`**
   Polls `/dut/status` until the DUT is at least as reachable as `--for` asks, then prints the state it reached. Gives up after the retries with status 1. Progress goes to stderr. Unlike `reserve`, this one retries by default.
+
+- **`account [--json]`**
+  Calls `/account` and prints the balance, what the month has given so far, the next recharge and the active reservations:
+
+  ```text
+  account-id: team-browser
+  tokens-available: 31.5
+  period-granted: 40 of 80
+  next-recharge: 20 at 2026-10-05T00:00:00Z
+  active-reservations: 1
+  ```
+
+  `--json` prints the service response as one JSON object instead. A service from before accounting makes it print `error: server does not support accounting` and exit with status 2, so a script can tell that case from an error (status 1).
+
+- **`account-history [--since TIME] [--until TIME] [--kind KIND] [--pool POOL] [--limit N] [--before ID] [--json]`**
+  Calls `/account/history` and prints one row per entry, newest first. `TIME` is epoch seconds or ISO 8601, read as UTC when it has no zone, e.g. `2026-09-01` or `2026-09-01T12:00:00+02:00`. When there are more entries, the `--before` value for the next page goes to stderr. Exits as `account` does on a service without accounting.
 
 **Example usage**:
 
@@ -636,6 +911,10 @@ dut-control-client wipe
 
 # Hand this reservation back
 dut-control-client lease
+
+# How many tokens are left, and what was spent this month
+dut-control-client account
+dut-control-client account-history --since 2026-09-01 --kind charge
 ```
 
 ### dut-control-admin
@@ -675,6 +954,23 @@ dut-control-client lease
 - **`dut-enable <dut-name>`** / **`dut-disable <dut-name>`**
   Calls `/conf/dut/enabled` to enable or disable a DUT at runtime and prints the JSON response; exits with status 1 if the service reports an error (e.g. unknown DUT). The change lasts until the next `reload` or service restart.
 
+- **`account <client>`**
+  Calls `/conf/account/info` and prints the account of the client as JSON
+
+- **`recharge <client> --tokens N --reason TEXT [--idempotency-key KEY]`** / **`set-balance <client> --tokens N --reason TEXT [--idempotency-key KEY]`**
+  Calls `/conf/account/recharge` or `/conf/account/set-balance`. Without `--idempotency-key`, a new UUID is used; pass your own to retry a call safely
+
+- **`account-ledger <client> [--since TIME] [--until TIME] [--pool POOL] [--kind KIND] [--limit N] [--before ID]`**
+  Calls `/conf/account/ledger` and prints the page as JSON
+
+- **`account-activity [--client NAME] [--action power|flash|wipe] [--since TIME] [--until TIME] [--pool POOL] [--limit N] [--before ID]`**
+  Calls `/conf/account/activity` and prints the page as JSON
+
+- **`account-report [--since TIME] [--until TIME] [--pool POOL] [--client NAME] [--format table|json|csv]`**
+  Calls `/conf/account/report` and prints the totals as a table (default), JSON, or CSV with a header row
+
+`TIME` is epoch seconds or ISO 8601, as for `dut-control-client`. The account subcommands exit with status 1, after printing the answer, when the service refuses the call.
+
 **Example**:
 
 ```bash
@@ -693,6 +989,10 @@ dut-control-admin prune
 # Take a misbehaving DUT out of rotation, then bring it back
 dut-control-admin dut-disable rpi5-03
 dut-control-admin dut-enable rpi5-03
+
+# Give a team 10 more tokens, and see what was spent in September
+dut-control-admin recharge client-01 --tokens 10 --reason "release week"
+dut-control-admin account-report --since 2026-09-01 --until 2026-10-01 --format csv
 ```
 
 ## Testing

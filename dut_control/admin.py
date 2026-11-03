@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import os
 import sys
+import uuid
 from typing import Any, Dict
 
 import requests
+
+from dut_control.client import _epoch
 
 
 DEFAULT_BASE_URL = os.environ.get("DUT_CONTROL_URL", "http://localhost:8000")
@@ -120,6 +124,141 @@ def cmd_dut_enabled(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _post_account(args: argparse.Namespace, path: str,
+                  payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST to a /conf/account endpoint; exit 1 unless it worked."""
+    payload = {"admin-key": _get_admin_key(),
+               **{k: v for k, v in payload.items() if v is not None}}
+    data = _post_json(args.url, path, payload, args.timeout).json()
+    if data.get("result") != 0:
+        _print_json(data)
+        sys.exit(1)
+    return data
+
+
+def cmd_account(args: argparse.Namespace) -> None:
+    _print_json(_post_account(args, "/conf/account/info",
+                              {"client": args.client}))
+
+
+def cmd_credit(args: argparse.Namespace) -> None:
+    """recharge and set-balance; a retry with the same key is a no-op."""
+    _print_json(_post_account(args, args.path, {
+        "client": args.client,
+        "tokens": args.tokens,
+        "reason": args.reason,
+        "idempotency-key": args.idempotency_key or str(uuid.uuid4()),
+    }))
+
+
+def cmd_account_ledger(args: argparse.Namespace) -> None:
+    _print_json(_post_account(args, "/conf/account/ledger", {
+        "client": args.client, "since": args.since, "until": args.until,
+        "kind": args.kind, "pool": args.pool, "limit": args.limit,
+        "before": args.before,
+    }))
+
+
+def cmd_account_activity(args: argparse.Namespace) -> None:
+    _print_json(_post_account(args, "/conf/account/activity", {
+        "client": args.client, "since": args.since, "until": args.until,
+        "action": args.action, "pool": args.pool, "limit": args.limit,
+        "before": args.before,
+    }))
+
+
+REPORT_COLUMNS = ("account-id", "pool", "kind", "entries", "tokens",
+                  "minutes")
+
+
+def cmd_account_report(args: argparse.Namespace) -> None:
+    data = _post_account(args, "/conf/account/report", {
+        "client": args.client, "pool": args.pool,
+        "since": args.since, "until": args.until,
+    })
+    rows = data["rows"]
+    if args.format == "json":
+        _print_json(rows)
+    elif args.format == "csv":
+        writer = csv.DictWriter(sys.stdout, fieldnames=REPORT_COLUMNS,
+                                lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    else:
+        print(f"{'ACCOUNT':<16}  {'POOL':<12}  {'KIND':<16}  {'ENTRIES':>7}  "
+              f"{'TOKENS':>9}  {'MINUTES':>7}")
+        for r in rows:
+            print(f"{r['account-id']:<16}  {r['pool'] or '-':<12}  "
+                  f"{r['kind']:<16}  {r['entries']:>7}  {r['tokens']:>+9g}  "
+                  f"{r['minutes']:>7}")
+
+
+def _add_time_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--since", type=_epoch,
+        help="Only entries from this time on (epoch or ISO 8601, UTC)")
+    parser.add_argument(
+        "--until", type=_epoch,
+        help="Only entries before this time (epoch or ISO 8601, UTC)")
+    parser.add_argument("--pool", help="Only entries for this pool")
+
+
+def _add_credit_parser(sub, name: str, path: str, help_text: str) -> None:
+    sp = sub.add_parser(name, help=help_text)
+    sp.add_argument("client", help="A client of the account")
+    sp.add_argument("--tokens", type=float, required=True,
+                    help="Tokens; negative takes them away"
+                    if name == "recharge" else "The new balance")
+    sp.add_argument("--reason", required=True,
+                    help="Why, kept in the ledger")
+    sp.add_argument("--idempotency-key",
+                    help="Applies once per account (default: a new UUID); "
+                         "reuse it to retry safely")
+    sp.set_defaults(func=cmd_credit, path=path)
+
+
+def _add_account_parsers(sub) -> None:
+    sp = sub.add_parser("account",
+                        help="Show the account of a client and its policy")
+    sp.add_argument("client", help="A client of the account")
+    sp.set_defaults(func=cmd_account)
+
+    _add_credit_parser(sub, "recharge", "/conf/account/recharge",
+                       "Add tokens to the account of a client")
+    _add_credit_parser(sub, "set-balance", "/conf/account/set-balance",
+                       "Set the balance of the account of a client")
+
+    sp = sub.add_parser("account-ledger",
+                        help="List the ledger of the account of a client")
+    sp.add_argument("client", help="A client of the account")
+    _add_time_filters(sp)
+    sp.add_argument("--kind",
+                    help="Only this kind, e.g. charge, refund, admin")
+    sp.add_argument("--limit", type=int, help="Entries per page")
+    sp.add_argument("--before", type=int,
+                    help="Entries older than this id, for the next page")
+    sp.set_defaults(func=cmd_account_ledger)
+
+    sp = sub.add_parser("account-activity",
+                        help="List the power, flash and wipe calls logged")
+    _add_time_filters(sp)
+    sp.add_argument("--client", help="Only the account of this client")
+    sp.add_argument("--action", choices=["power", "flash", "wipe"],
+                    help="Only this action")
+    sp.add_argument("--limit", type=int, help="Events per page")
+    sp.add_argument("--before", type=int,
+                    help="Events older than this id, for the next page")
+    sp.set_defaults(func=cmd_account_activity)
+
+    sp = sub.add_parser("account-report",
+                        help="Totals by account, pool and kind")
+    _add_time_filters(sp)
+    sp.add_argument("--client", help="Only the account of this client")
+    sp.add_argument("--format", choices=["table", "json", "csv"],
+                    default="table", help="Output (default: %(default)s)")
+    sp.set_defaults(func=cmd_account_report)
+
+
 # ---------------------------------------------------------------------------
 # Argparse / entry point
 # ---------------------------------------------------------------------------
@@ -194,6 +333,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_dut_disable.add_argument("dut_name", help="DUT name")
     sp_dut_disable.set_defaults(func=cmd_dut_enabled, enabled=False)
+
+    _add_account_parsers(sub)
 
     return p
 

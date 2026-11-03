@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -36,6 +37,9 @@ _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 DEFAULT_TIMEOUT = 10.0
 # One where it first settles a mux and writes to an SD card over USB.
 STORAGE_TIMEOUT = 900.0
+
+# A server from before accounting answers /account with a 404.
+NO_ACCOUNTING_EXIT = 2
 
 _SIZE = re.compile(r"^(\d+)\s*([kmg])?i?b?$", re.IGNORECASE)
 _UNIT_BYTES = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
@@ -167,6 +171,14 @@ def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
     status = data.get("status")
     err = data.get("error", "unknown error")
     print(f"{prefix}: {err} (status={status})", file=sys.stderr)
+    # What a quota refusal says about when it clears.
+    if "tokens-required" in data:
+        print(f"needs {data['tokens-required']:g} tokens, has "
+              f"{data['tokens-available']:g}; next recharge of "
+              f"{data['next-recharge-tokens']:g} at "
+              f"{data['next-recharge-at-iso']}", file=sys.stderr)
+    if "retry-after" in data:
+        print(f"retry after {data['retry-after']}s", file=sys.stderr)
     sys.exit(1)
 
 
@@ -189,6 +201,10 @@ def cmd_pools(args: argparse.Namespace) -> None:
 
     if data.get("status") != 0:
         _print_error_and_exit("pools failed", data)
+
+    if args.json:
+        print(json.dumps(data))
+        return
 
     pools = data.get("pools", [])
     width = max([len("POOL")] + [len(p["name"]) for p in pools])
@@ -434,6 +450,80 @@ def _reached(state: str, wanted: str) -> bool:
     return REACHABILITY.index(state) >= REACHABILITY.index(wanted)
 
 
+def _epoch(value: str) -> int:
+    """A time as epoch seconds or ISO 8601; without a zone, UTC."""
+    if value.strip().isdigit():
+        return int(value)
+    try:
+        when = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"not an epoch or an ISO 8601 time: {value!r}")
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return int(when.timestamp())
+
+
+def _post_account(args: argparse.Namespace, path: str,
+                  payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST to an accounting endpoint, with the client key."""
+    client_key = os.environ.get(CLIENT_KEY_ENV)
+    if not client_key:
+        print(f"error: {CLIENT_KEY_ENV} not set; cannot read the account",
+              file=sys.stderr)
+        sys.exit(1)
+
+    resp = requests.post(
+        _full_url(args.url, path),
+        json={"client-key": client_key, **payload},
+        timeout=_timeout(args),
+    )
+    if resp.status_code == 404:
+        print("error: server does not support accounting", file=sys.stderr)
+        sys.exit(NO_ACCOUNTING_EXIT)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != 0:
+        _print_error_and_exit("account failed", data)
+    return data
+
+
+def cmd_account(args: argparse.Namespace) -> None:
+    data = _post_account(args, "/account", {})
+    if args.json:
+        print(json.dumps(data))
+        return
+
+    print(f"account-id: {data['account-id']}")
+    print(f"tokens-available: {data['tokens-available']:g}")
+    print(f"period-granted: {data['period-granted']:g} of "
+          f"{data['monthly-token-limit']:g}")
+    print(f"next-recharge: {data['next-recharge-tokens']:g} at "
+          f"{data['next-recharge-at-iso']}")
+    print(f"active-reservations: {data['active-reservations']}")
+
+
+def cmd_account_history(args: argparse.Namespace) -> None:
+    filters = {key: getattr(args, key)
+               for key in ("since", "until", "kind", "pool", "limit",
+                           "before")
+               if getattr(args, key) is not None}
+    data = _post_account(args, "/account/history", filters)
+    if args.json:
+        print(json.dumps(data))
+        return
+
+    print(f"{'TIME':<20}  {'KIND':<16}  {'TOKENS':>8}  {'BALANCE':>8}  "
+          "POOL  DUT")
+    for e in data["entries"]:
+        print(f"{e['ts-iso']:<20}  {e['kind']:<16}  {e['tokens']:>+8g}  "
+              f"{e['balance-after']:>8g}  {e['pool'] or '-'}  "
+              f"{e['dut-name'] or '-'}")
+    if data.get("next-before") is not None:
+        print(f"more entries: --before {data['next-before']}",
+              file=sys.stderr)
+
+
 def cmd_wait(args: argparse.Namespace) -> None:
     token = _required_token(args)
 
@@ -488,6 +578,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp_pools = sub.add_parser(
         "pools",
         help="List pools with their enabled and free DUT counts",
+    )
+    sp_pools.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the listing as one JSON object, with the token "
+             "prices when the service has accounting on",
     )
     sp_pools.set_defaults(func=cmd_pools)
 
@@ -667,6 +763,46 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: %(default)s)",
     )
     sp_wait.set_defaults(func=cmd_wait)
+
+    # account
+    sp_account = sub.add_parser(
+        "account",
+        help="Show the token balance of this client's account",
+    )
+    sp_account.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the account as one JSON object",
+    )
+    sp_account.set_defaults(func=cmd_account)
+
+    # account-history
+    sp_history = sub.add_parser(
+        "account-history",
+        help="List the charges, refunds and recharges of the account",
+    )
+    sp_history.add_argument(
+        "--since", type=_epoch,
+        help="Only entries from this time on (epoch or ISO 8601, UTC)")
+    sp_history.add_argument(
+        "--until", type=_epoch,
+        help="Only entries before this time (epoch or ISO 8601, UTC)")
+    sp_history.add_argument(
+        "--kind",
+        help="Only this kind, e.g. charge, refund, recharge")
+    sp_history.add_argument("--pool", help="Only entries for this pool")
+    sp_history.add_argument(
+        "--limit", type=int,
+        help="Entries per page (default: the service's, 100)")
+    sp_history.add_argument(
+        "--before", type=int,
+        help="Entries older than this id, to read the next page")
+    sp_history.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the page as one JSON object",
+    )
+    sp_history.set_defaults(func=cmd_account_history)
 
     return p
 
