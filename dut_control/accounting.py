@@ -103,6 +103,11 @@ def to_tokens(milli: int) -> float:
     return milli / MILLI
 
 
+def iso(ts: int) -> str:
+    """An epoch as ISO 8601 in UTC, for people and for scripts."""
+    return _utc(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def reservation_price(minutes: int, token_minutes: int, pool_cost) -> int:
     """Millitokens for ``minutes`` of a pool of cost ``pool_cost``."""
     return round(minutes * pool_cost * MILLI / token_minutes)
