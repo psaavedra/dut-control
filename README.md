@@ -142,6 +142,9 @@ accounting:
 | `recharge-hour-utc` | `0` | Hour of the recharge, 0 to 23, in UTC. |
 | `database` | `accounting.sqlite3` in `DUT_CONTROL_STATE_DIR`, else in the config directory | Where the balances and the history are kept. |
 | `pool-costs` | `{}` | Cost of each pool; a pool not listed costs 1. A reservation of 120 minutes in a pool of cost 2 takes 2 tokens. |
+| `strict-pool-costs` | `false` | Refuse a configuration where one DUT sits in pools of different costs, instead of only logging a warning. |
+
+A reservation is priced by the pool it is asked through, so a DUT in a cheap pool and in an expensive one can be had at the cheap price. On load and on `/conf/reload`, the service logs a warning that names each such DUT with its pools and their costs, e.g. `dut-01 (rpi5=1, rpi5-fast=3)`. With `strict-pool-costs: true` the configuration fails to load instead, and a reload keeps the one already running. Use [`allowed-pools`](#client-configuration) to keep a client out of the cheap pool when the difference is on purpose.
 
 The `default-*` values apply to every client without its own `quota`; see [Client configuration](#client-configuration). An unknown key or a bad value (a negative number, `token-minutes: 0`, a cost of 0, `recharge-hour-utc: 24`) makes the configuration fail to load, since a typo here would change what a team may spend.
 
