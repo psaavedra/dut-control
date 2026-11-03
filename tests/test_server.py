@@ -3275,3 +3275,56 @@ def test_admin_activity_lists_the_logged_calls(flask_client, monkeypatch,
                                                        "power"]
     assert page(client="nobody")["result"] == -1
     assert page(since="today")["result"] == -2
+
+
+# ---------------------------------------------------------------------------
+# Pool costs of shared DUTs
+# ---------------------------------------------------------------------------
+
+def _shared_dut_nodes():
+    return [{"name": "node-01", "ssh": {},
+             "duts": [_make_pool_dut("dut-01", ["rpi5", "rpi5-fast"]),
+                      _make_pool_dut("dut-02", "rpi5")]}]
+
+
+def test_a_dut_in_pools_of_different_costs_is_warned_about(caplog):
+    conf = server_mod._normalize_accounting(
+        [{"enabled": True}, {"pool-costs": {"rpi5-fast": 3}}], Path("."))
+
+    server_mod._check_pool_costs(conf, _shared_dut_nodes())
+
+    assert "dut-01 (rpi5=1, rpi5-fast=3)" in caplog.text
+    assert "dut-02" not in caplog.text
+    caplog.clear()
+    server_mod._check_pool_costs(dict(conf, enabled=False),
+                                 _shared_dut_nodes())
+    assert caplog.text == ""
+
+
+def test_a_strict_reload_refuses_mixed_costs_and_keeps_the_old_config(
+        tmp_path, monkeypatch):
+    (tmp_path / "conf.yml").write_text(f"""---
+admin-key: new-key
+accounting:
+  - enabled: true
+  - strict-pool-costs: true
+  - database: {tmp_path / "accounting.sqlite3"}
+  - pool-costs:
+      rpi5-fast: 3
+""")
+    (tmp_path / "nodes").mkdir()
+    (tmp_path / "nodes" / "node-01.yml").write_text("""
+- name: node-01
+  duts:
+    - name: dut-01
+      metadata:
+        - pools: [rpi5, rpi5-fast]
+""")
+    monkeypatch.setattr(server_mod, "CONFIG_DIR", tmp_path)
+    old_key = server_mod.admin_key
+
+    with pytest.raises(ValueError, match="dut-01"):
+        server_mod.reload_config()
+
+    assert server_mod.admin_key == old_key
+    assert not (tmp_path / "accounting.sqlite3").exists()
