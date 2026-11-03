@@ -2945,3 +2945,126 @@ def test_pools_shows_the_price_of_each_pool(flask_client, accounting_on):
         ("rpi4", 12, 12.0, False), ("rpi5", 2, 2.0, True)]
     assert data["pools"][0]["reservation-minutes"] == 120
     assert data["pools"][0]["free-duts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Quota gate of /reserve
+# ---------------------------------------------------------------------------
+
+def _quota_setup(monkeypatch, quota=None, duts=1, pool_cost=2):
+    """client-01 with a quota, DUTs in rpi5, tunnels recorded."""
+    client = _make_client()
+    if quota is not None:
+        client["quota"] = quota
+    node = {"name": "node-01", "ssh": {"ip": "192.0.2.20"},
+            "duts": [_make_pool_dut(f"dut-{i:02}", ["rpi5", "rpi5-fast"])
+                     for i in range(1, duts + 1)]}
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+    server_mod.accounting_conf["pool-costs"]["rpi5"] = pool_cost
+    monkeypatch.setattr(server_mod, "reserve_attempts", {})
+    _record_tunnels(monkeypatch)
+    return client
+
+
+@pytest.mark.parametrize("mode, quota, status, warning", [
+    ("observe", None, 0, None),
+    ("warn", None, 0, ["quota_exceeded"]),
+    ("reject", None, -6, None),
+    ("reject", {"enabled": False}, 0, None),
+], ids=["observe", "warn", "reject", "reject-exempt"])
+def test_reserve_short_of_tokens_by_enforcement_mode(
+        flask_client, monkeypatch, accounting_on, mode, quota, status,
+        warning):
+    server_mod.accounting_conf["enforcement"] = mode
+    # A new account holds 10 tokens; one reservation costs 12.
+    client = _quota_setup(monkeypatch, quota, pool_cost=12)
+
+    data = _reserve_json(flask_client, client)
+
+    assert data["status"] == status
+    assert data.get("quota-warning") == warning
+    if status == 0:
+        assert data["tokens-available"] == -2.0
+    else:
+        assert data["error-code"] == "quota_exceeded"
+        assert (data["tokens-required"], data["tokens-available"]) == \
+            (12.0, 10.0)
+        assert data["next-recharge-at-iso"].endswith("Z")
+        assert server_mod.reserves == []
+        assert accounting_on.history("client-01", kind="charge") == []
+
+
+def test_reserve_refuses_past_the_active_reservations(
+        flask_client, monkeypatch, accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    client = _quota_setup(monkeypatch, {"max-active-reservations": 1},
+                          duts=2)
+
+    assert _reserve_json(flask_client, client)["status"] == 0
+    data = _reserve_json(flask_client, client)
+
+    assert (data["status"], data["error-code"]) == (-8, "concurrency_limit")
+
+
+def test_reserve_refuses_past_the_pool_concurrency(
+        flask_client, monkeypatch, accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    client = _quota_setup(monkeypatch, {"pool-concurrency": {"rpi5-fast": 1}},
+                          duts=3)
+
+    # The DUT reserved through rpi5 also counts in rpi5-fast.
+    assert _reserve_json(flask_client, client, "rpi5")["status"] == 0
+    assert _reserve_json(flask_client, client, "rpi5-fast")["status"] == -8
+    assert _reserve_json(flask_client, client, "rpi5")["status"] == 0
+
+
+def test_reserve_refuses_too_many_calls_until_the_window_moves(
+        flask_client, monkeypatch, accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    client = _quota_setup(
+        monkeypatch, {"reserve-rate": {"requests": 2, "window-seconds": 60}})
+    now = int(time.time())
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: now)
+
+    # Both calls count, though the second finds the pool busy.
+    assert [_reserve_json(flask_client, client)["status"]
+            for _ in range(2)] == [0, -4]
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: now + 20)
+    data = _reserve_json(flask_client, client)
+    assert (data["status"], data["retry-after"]) == (-9, 40)
+
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: now + 61)
+    assert _reserve_json(flask_client, client)["status"] == -4
+
+
+def test_reserve_concurrent_calls_share_the_balance(monkeypatch,
+                                                    accounting_on):
+    server_mod.accounting_conf["enforcement"] = "reject"
+    # Two free DUTs, 10 tokens, 6 a reservation: only one fits.
+    client = _quota_setup(monkeypatch, duts=2, pool_cost=6)
+
+    # Hold both calls once the balance looked good to them. With the
+    # lock, the second one waits for the first and the barrier times
+    # out; without it, both go on and both are charged.
+    barrier = threading.Barrier(2, timeout=0.5)
+    balance_problem = server_mod._balance_problem
+
+    def slow_balance_problem(*args):
+        problem = balance_problem(*args)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return problem
+
+    monkeypatch.setattr(server_mod, "_balance_problem", slow_balance_problem)
+
+    def post(_):
+        return _reserve_json(server_mod.server.test_client(), client)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = sorted(r["status"] for r in pool.map(post, range(2)))
+
+    assert statuses == [-6, 0]
