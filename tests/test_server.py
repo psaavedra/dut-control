@@ -3077,7 +3077,7 @@ def test_reserve_concurrent_calls_share_the_balance(monkeypatch,
 
 ACCOUNT_ADMIN_PATHS = ["/conf/account/info", "/conf/account/recharge",
                        "/conf/account/set-balance", "/conf/account/ledger",
-                       "/conf/account/report"]
+                       "/conf/account/report", "/conf/account/activity"]
 
 
 @pytest.fixture
@@ -3243,3 +3243,35 @@ def test_dut_status_is_not_logged(flask_client, monkeypatch, accounting_on):
     flask_client.post("/dut/status", json={"token": token})
 
     assert _activity(accounting_on) == []
+
+
+def test_admin_activity_lists_the_logged_calls(flask_client, monkeypatch,
+                                               admin_key, accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client)["token"]
+    errors = iter([None, "power script failed"])
+    monkeypatch.setattr(server_mod, "_power_action_error",
+                        lambda *a: next(errors))
+    monkeypatch.setattr(server_mod, "_wipe_storage", lambda *a: None)
+    for path in ("/power/on", "/power/off", "/wipe"):
+        flask_client.post(path, json={"token": token})
+
+    def page(**body):
+        return _admin(flask_client, "/conf/account/activity", admin_key,
+                      **body).get_json()
+
+    first = page(client="client-01", action="power", limit=1)
+    [event] = first["events"]
+    assert (event["action"], event["pool"], event["result"],
+            event["error"], event["metadata"]) == (
+        "power", "rpi5", "failed", "power script failed",
+        {"action": "off"})
+    assert "reservation_token_hash" not in event
+    rest = page(action="power", before=first["next-before"])
+    assert [e["metadata"] for e in rest["events"]] == [{"action": "on"}]
+    assert rest["next-before"] is None
+    assert [e["action"] for e in page()["events"]] == ["wipe", "power",
+                                                       "power"]
+    assert page(client="nobody")["result"] == -1
+    assert page(since="today")["result"] == -2
