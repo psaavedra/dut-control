@@ -312,7 +312,8 @@ class AccountingStore:
                         -amount, reservation_token_hash=token_hash,
                         pool=pool, dut_name=dut_name, minutes=minutes,
                         actor=actor)
-            return self._summary(self._row(conn, account), policy, now)
+            summary = self._summary(self._row(conn, account), policy, now)
+            return dict(summary, charged=amount)
 
     def _give_back(self, token: str, now: int, kind: str, whole: bool):
         token_hash = self.token_hash(token)

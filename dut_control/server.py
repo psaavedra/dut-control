@@ -19,6 +19,8 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 import yaml
 
+from dut_control import accounting
+
 # ---------------------------------------------------------------------------
 # Global definitions
 # ---------------------------------------------------------------------------
@@ -32,6 +34,7 @@ MAX_UPLOAD_BYTES = 8 * 1024 ** 3
 # Enough to take out the partition table, /boot and the head of the
 # rootfs on the usual layouts.
 WIPE_DEFAULT_BYTES = 128 * _MIB
+RESERVATION_MINUTES = 120
 
 _SSH_SKIP_HOST_CHECK = [
     "-o", "StrictHostKeyChecking=no",
@@ -47,6 +50,7 @@ CONFIG_DIR = Path(os.environ.get("DUT_CONTROL_DIR", "dut-control"))
 
 admin_key = None
 accounting_conf = {}  # see _normalize_accounting()
+accounting_store = None  # an AccountingStore when accounting is on
 nodes = []       # list[dict]
 clients = []     # list[dict]
 reserves = []    # list[dict]
@@ -495,20 +499,33 @@ def _load_clients(config_dir: Path):
     return result
 
 
+def _open_store(conf: dict):
+    """The store for an accounting section; the open one if it is the
+    same file, so a reload does not reopen it."""
+    if not conf["enabled"]:
+        return None
+    store = accounting_store
+    if store is not None and store.path == conf["database"]:
+        return store
+    return accounting.AccountingStore(conf["database"])
+
+
 def reload_config():
     """
     Reload admin_key, accounting_conf, nodes, clients from YAML.
     Does NOT touch reserves/processes.
     """
-    global admin_key, accounting_conf
+    global admin_key, accounting_conf, accounting_store
 
     conf = _load_conf(CONFIG_DIR)
     new_nodes = _load_nodes(CONFIG_DIR)
     new_clients = _load_clients(CONFIG_DIR)
+    new_store = _open_store(conf["accounting"])
 
     with state_lock:
         admin_key = conf["admin-key"]
         accounting_conf = conf["accounting"]
+        accounting_store = new_store
         server.config["MAX_CONTENT_LENGTH"] = int(
             conf.get("max-upload-bytes", MAX_UPLOAD_BYTES))
         nodes[:] = new_nodes
@@ -1029,6 +1046,85 @@ def _rollback_reserve(token: str):
         reserves[:] = [r for r in reserves if r.get("token") != token]
 
 
+# ---------------------------------------------------------------------------
+# Accounting hooks; each one does nothing with accounting off.
+# ---------------------------------------------------------------------------
+
+def _account_id(client: dict) -> str:
+    return str(client.get("account-id", client["name"]))
+
+
+def _account_policy(client: dict) -> accounting.Policy:
+    """The defaults of conf.yml, with the client's quota on top."""
+    quota = client.get("quota", {})
+
+    def tokens(key, default):
+        return quota.get(key, accounting_conf.get(f"default-{key}", default))
+
+    monthly = tokens("monthly-token-limit", None)
+    return accounting.Policy(
+        monthly_limit=accounting.to_milli(monthly),
+        weekly_recharge=accounting.to_milli(
+            tokens("weekly-recharge-tokens", None)),
+        balance_cap=accounting.to_milli(tokens("balance-cap", monthly)),
+        recharge_weekday=accounting_conf["recharge-weekday"],
+        recharge_hour_utc=accounting_conf["recharge-hour-utc"])
+
+
+def _reservation_price(pool: str) -> int:
+    """Millitokens for one reservation, by the pool asked for, not by
+    the other pools of the DUT, so the price is known in advance."""
+    return accounting.reservation_price(
+        RESERVATION_MINUTES, accounting_conf["token-minutes"],
+        accounting_conf["pool-costs"].get(pool, 1))
+
+
+def _charge_reserve(client: dict, pool: str, dut: dict, token: str,
+                    now: int):
+    """Charge a new reservation. Nothing is refused yet: the balance
+    may go below zero."""
+    if accounting_store is None:
+        return None
+    return accounting_store.charge(
+        _account_id(client), _account_policy(client), now, token=token,
+        pool=pool, dut_name=dut["name"], minutes=RESERVATION_MINUTES,
+        amount=_reservation_price(pool), actor=client["name"],
+        allow_negative=True)
+
+
+def _accounting_fields(client: dict, charge, valid_until: int) -> dict:
+    """What /reserve adds to its answer; nothing with accounting off."""
+    if charge is None:
+        return {}
+    return {
+        "account-id": _account_id(client),
+        "charged-tokens": accounting.to_tokens(charge["charged"]),
+        "tokens-available": accounting.to_tokens(charge["balance"]),
+        "valid-until": valid_until,
+    }
+
+
+def _undo_reserve(token: str, now: int):
+    """Drop a reservation that never ran and give its charge back."""
+    _rollback_reserve(token)
+    if accounting_store is not None:
+        accounting_store.rollback(token, now)
+
+
+def _refund_reserves(tokens: set[str], now: int):
+    """
+    Give back the unused time of reservations released early. A failed
+    refund is logged and does not fail the release, which is done.
+    """
+    if accounting_store is None:
+        return
+    for token in tokens:
+        try:
+            accounting_store.refund(token, now)
+        except Exception:
+            server.logger.exception("refund of a released reservation failed")
+
+
 @server.route("/pools", methods=["POST", "PUT"])
 @validate_client
 def pools():
@@ -1062,18 +1158,21 @@ def reserve():
             return _error_response(-4, "no free ports for client")
 
         token = secrets.token_hex(8)
+        valid_until = now + RESERVATION_MINUTES * 60
         reserves.append({
             "token": token,
             "valid-from": now,
-            "valid-until": now + 2 * 3600,  # 2 hours
+            "valid-until": valid_until,
             "client-key": request.client["key"],
             "dut-name": dut["name"],
         })
 
         try:
+            charge = _charge_reserve(
+                request.client, request.pool, dut, token, now)
             _start_ssh_tunnel(request.client, dut, free_port, token)
         except Exception as e:
-            _rollback_reserve(token)
+            _undo_reserve(token, now)
             return _error_response(-99, f"internal error: {e}")
 
     return jsonify({
@@ -1084,6 +1183,7 @@ def reserve():
         "ssh-port": dut["network"]["ssh-port"],
         "tunnel-ssh-port": free_port,
         "client-ssh-overrides": request.client.get("ssh-overrides", []),
+        **_accounting_fields(request.client, charge, valid_until),
     }), 200
 
 
@@ -1172,6 +1272,7 @@ def lease():
 
         _terminate_processes(tokens_to_release)
         _expire_reserves(tokens_to_release, now)
+        _refund_reserves(tokens_to_release, now)
         return jsonify({"status": 0}), 200
 
     except Exception as e:
