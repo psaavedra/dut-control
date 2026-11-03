@@ -110,6 +110,41 @@ max-upload-bytes: 8589934592
 
 The value of `admin-key` must be provided by admin clients when calling admin endpoints.
 
+#### Accounting
+
+An optional `accounting` section gives each account a budget of tokens. Tokens pay for reserved time, and a pool can cost more than another:
+
+```yaml
+accounting:
+  - enabled: true
+  - enforcement: observe
+  - token-minutes: 120
+  - default-monthly-token-limit: 40
+  - default-weekly-recharge-tokens: 10
+  - default-balance-cap: 40
+  - recharge-weekday: 1
+  - recharge-hour-utc: 0
+  - database: /var/lib/dut-control/accounting.sqlite3
+  - pool-costs:
+      rpi4: 1
+      rpi5: 2
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turn accounting on. Without the section, or with `false`, nothing changes. |
+| `enforcement` | `observe` | `observe` only records, `warn` lets a reservation through with a warning, `reject` refuses it. |
+| `token-minutes` | `120` | Minutes of reservation that one token pays for in a pool of cost 1. |
+| `default-monthly-token-limit` | `40` | Most tokens the weekly recharges give in one calendar month (UTC). |
+| `default-weekly-recharge-tokens` | `10` | Tokens added at each weekly recharge. |
+| `default-balance-cap` | the monthly limit | Most tokens an account can hold. |
+| `recharge-weekday` | `1` | ISO day of the recharge, 1 (Monday) to 7 (Sunday). |
+| `recharge-hour-utc` | `0` | Hour of the recharge, 0 to 23, in UTC. |
+| `database` | `accounting.sqlite3` in `DUT_CONTROL_STATE_DIR`, else in the config directory | Where the balances and the history are kept. |
+| `pool-costs` | `{}` | Cost of each pool; a pool not listed costs 1. A reservation of 120 minutes in a pool of cost 2 takes 2 tokens. |
+
+The `default-*` values apply to every client without its own `quota`; see [Client configuration](#client-configuration). An unknown key or a bad value (a negative number, `token-minutes: 0`, a cost of 0, `recharge-hour-utc: 24`) makes the configuration fail to load, since a typo here would change what a team may spend.
+
 ### Client configuration
 
 Clients are defined under `clients/*.yml`.
@@ -149,6 +184,35 @@ An optional `allowed-pools` list restricts which pools a client can list and res
 A client without the key, like `client-01` above, reaches every pool, so configurations written before the key keep working; `allowed-pools: []` denies every pool. The value must be a YAML list of pool names, and a scalar, a mapping, an empty entry or a bare `yes` (which YAML reads as a boolean) makes the configuration fail to load rather than quietly changing who can reach what. Repeated names are dropped. A name is not checked against the configured pools, since a pool may be added, removed or disabled later without making the policy invalid; a permitted pool that does not exist simply never shows up.
 
 The policy covers discovery and new reservations only: a reservation already handed out survives a `/conf/reload` that drops its pool, so its token can still be used and released. `/conf/info/clients` reports `allowed-pools` for the clients that have one.
+
+Two optional keys tie a client to the [accounting](#accounting) budget:
+
+```yaml
+- name: client-03
+  key: 0c5e7a1d9f2b4863
+  account-id: team-browser
+  ssh:
+    - ip: 192.168.1.248
+    - user: ci
+  ports-range:
+    - from: 5200
+    - to: 5210
+  quota:
+    - enabled: true
+    - monthly-token-limit: 80
+    - weekly-recharge-tokens: 20
+    - balance-cap: 80
+    - max-active-reservations: 2
+    - pool-concurrency:
+        rpi5-fast: 1
+    - reserve-rate:
+        - requests: 10
+        - window-seconds: 60
+```
+
+`account-id` names the account the client spends from; it defaults to the client `name`. The history is kept by account, so a new `key` with the same `account-id` keeps it. Two clients can share an account, for example the old and the new key during a rotation, but then they must have the same `quota`.
+
+`quota` overrides the defaults of `conf.yml` for that account. `monthly-token-limit`, `weekly-recharge-tokens` and `balance-cap` take the place of the `default-*` keys. `max-active-reservations` caps the reservations held at the same time, and `pool-concurrency` does the same per pool. `reserve-rate` caps the `/reserve` calls in a time window. `enabled: false` makes the account exempt: its use is still recorded but never refused. As for `allowed-pools`, a bad value makes the configuration fail to load. `/conf/info/clients` shows both keys for the clients that have them.
 
 `ssh.ip` and `ssh.port` are the address the service uses to reach the client back (reverse tunnel and image `scp`). A client that is not reachable at that address, typically because it sits behind NAT and only knows its public address and forwarded port at run time, can announce the right values on each request; see [Client SSH overrides](#client-ssh-overrides). Such a client still needs an `ssh` section in its YAML entry, if only for `user`; the announced values replace the configured ones in memory.
 
