@@ -1666,6 +1666,71 @@ def conf_account_report(store, body):
 
 
 # ---------------------------------------------------------------------------
+# Audit of the actions on a reserved DUT
+# ---------------------------------------------------------------------------
+
+def _power_details(action=None):
+    return {"action": action}
+
+
+def _flash_details(**_):
+    """How the image came, and its bare name; never a path."""
+    upload = request.files.get("image")
+    if upload is not None:
+        name = Path(upload.filename or "").name
+        return {"mode": "upload", "image-name": name,
+                "bmap": "bmap" in request.files}
+    path = (request.get_json(silent=True) or {}).get("path") or ""
+    return {"mode": "named", "image-name": Path(str(path)).name}
+
+
+def _wipe_details(**_):
+    body = request.get_json(silent=True) or {}
+    return {"size-bytes": body.get("size", WIPE_DEFAULT_BYTES)}
+
+
+def _record_activity(store, action: str, details: dict, data: dict):
+    """
+    One activity row for the action just done. The error is cut at its
+    first colon: the fixed message stays, and a path an OS error may
+    carry after it does not.
+    """
+    token = _request_token()
+    reserve_entry = _get_reserve_by_token(token) or {}
+    client = _get_client_by_key(reserve_entry.get("client-key"))
+    error = data.get("error")
+    store.record_activity(
+        _now_epoch(), account=_account_id(client) if client else "",
+        token=token, action=action,
+        dut_name=reserve_entry.get("dut-name"),
+        result="success" if data.get("status") == 0 else "failed",
+        error=error.split(":")[0] if error else None, metadata=details)
+
+
+def audited(action: str, details):
+    """
+    Log what the endpoint did, success or failure, with accounting on.
+    ``details`` turns the request into safe metadata. Goes under
+    validate_token, so only actions on a valid reservation are logged.
+    A failed log does not fail the action, which is done.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            response = func(*args, **kwargs)
+            store = accounting_store
+            if store is not None:
+                try:
+                    _record_activity(store, action, details(**kwargs),
+                                     response[0].get_json())
+                except Exception:
+                    server.logger.exception(f"audit of {action} failed")
+            return response
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
 # /power/<on|off|cycle>
 # ---------------------------------------------------------------------------
 
@@ -1732,6 +1797,7 @@ def _power_action_error(action: str, node: dict, dut: dict):
 
 @server.route("/power/<action>", methods=["POST", "PUT"])
 @validate_token
+@audited("power", _power_details)
 def power(action):
     if action not in ("on", "off", "cycle"):
         return jsonify({"status": -99, "error": "invalid action"}), 200
@@ -2140,6 +2206,7 @@ def _flash_upload(node: dict, dut: dict, image, bmap):
 
 @server.route("/flash", methods=["POST", "PUT"])
 @validate_token
+@audited("flash", _flash_details)
 def flash():
     reserve_entry = _get_reserve_by_token(_request_token())
 
@@ -2207,6 +2274,7 @@ def _upload_too_large(_):
 
 @server.route("/wipe", methods=["POST", "PUT"])
 @validate_token
+@audited("wipe", _wipe_details)
 def wipe():
     body = request.get_json(silent=True) or {}
     token = body.get("token")
