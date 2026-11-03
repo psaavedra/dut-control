@@ -451,6 +451,86 @@ If no matching reservations exist, the service still returns `{"status": 0}`.
 
 Internal errors are returned as `{"status": -99, "error": "..."}`.
 
+### Account: /account
+
+The token balance of the client's account and its next recharge. See [Accounting](#accounting).
+
+- **Method**: `POST` (or `PUT`)
+- **Path**: `/account`
+- **Request body**: `client-key` (string, required)
+
+**Success response**:
+
+```json
+{
+  "status": 0,
+  "account-id": "team-browser",
+  "tokens-available": 31.5,
+  "monthly-token-limit": 80.0,
+  "weekly-recharge-tokens": 20.0,
+  "balance-cap": 80.0,
+  "period-start": 1788220800,
+  "period-end": 1790812800,
+  "period-granted": 40.0,
+  "next-recharge-at": 1791158400,
+  "next-recharge-at-iso": "2026-10-05T00:00:00Z",
+  "next-recharge-tokens": 20.0,
+  "active-reservations": 1
+}
+```
+
+The call first applies the recharges that are due. `period-start` and `period-end` bound the calendar month (UTC), and `period-granted` is what the recharges gave in it. `next-recharge-tokens` is what the next recharge will add, after the monthly limit and the cap. `active-reservations` counts the unexpired reservations of every client of the account. Times are epoch seconds.
+
+**Error responses**:
+
+- `status = -1`: missing or invalid `client-key`
+- `status = -10`: accounting is off on this service
+
+A service from before accounting answers with HTTP 404.
+
+### Account history: /account/history
+
+The charges, refunds and recharges of the client's account, newest first.
+
+- **Method**: `POST` (or `PUT`)
+- **Path**: `/account/history`
+- **Request body**:
+  - `client-key` (string, required)
+  - `since`, `until` (integers, optional): only entries from `since` and before `until`, in epoch seconds
+  - `kind` (string, optional): only one kind of entry: `recharge`, `charge`, `refund`, `reserve-rollback` or `admin`
+  - `pool` (string, optional): only entries for that pool
+  - `limit` (integer, optional): entries per page; 100 by default, 1000 at most
+  - `before` (integer, optional): only entries older than this id, to read the next page
+
+**Success response**:
+
+```json
+{
+  "status": 0,
+  "account-id": "team-browser",
+  "entries": [
+    {
+      "id": 7,
+      "ts": 1790600000,
+      "ts-iso": "2026-09-27T15:33:20Z",
+      "kind": "charge",
+      "tokens": -2.0,
+      "balance-after": 31.5,
+      "pool": "rpi5",
+      "dut-name": "rpi5-01",
+      "minutes": 120,
+      "actor": "client-01",
+      "reason": null
+    }
+  ],
+  "next-before": 7
+}
+```
+
+`tokens` is negative for what leaves the balance. A full page sets `next-before` to the id to pass as `before` for the next one; otherwise it is `null`. Entries never hold the reservation token.
+
+**Error responses**: as for `/account`, plus `status = -99` for a filter that is not a non-negative integer.
+
 ### Power control: /power/<on|off|cycle>
 
 Control DUT power for an existing reservation.
@@ -625,7 +705,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 **Environment**:
 
 - `DUT_CONTROL_URL` (optional): base URL of the service (default `http://localhost:8000`)
-- `DUT_CONTROL_CLIENT_KEY` (required for `reserve` and `lease`): client key matching configuration
+- `DUT_CONTROL_CLIENT_KEY` (required for `pools`, `reserve`, `lease`, `account` and `account-history`): client key matching configuration
 - `DUT_CONTROL_TOKEN` (optional): reservation token for `power`, `flash`, `status` and `lease`, used when none is given on the command line. Preferred over the positional argument on a shared host, where a token on a command line is readable in `ps` by every other user and ends up in any log that echoes the command
 - `DUT_CONTROL_CLIENT_SSH_IP` (optional): address the service must use to reach this host back, overriding the `ssh.ip` of its configuration entry
 - `DUT_CONTROL_CLIENT_SSH_PORT` (optional): port to use instead of the configured `ssh.port`
@@ -668,6 +748,22 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 - **`wait [token] [--for ping|ssh] [--retries N] [--retries-wait D]`**
   Polls `/dut/status` until the DUT is at least as reachable as `--for` asks, then prints the state it reached. Gives up after the retries with status 1. Progress goes to stderr. Unlike `reserve`, this one retries by default.
+
+- **`account [--json]`**
+  Calls `/account` and prints the balance, what the month has given so far, the next recharge and the active reservations:
+
+  ```text
+  account-id: team-browser
+  tokens-available: 31.5
+  period-granted: 40 of 80
+  next-recharge: 20 at 2026-10-05T00:00:00Z
+  active-reservations: 1
+  ```
+
+  `--json` prints the service response as one JSON object instead. A service from before accounting makes it print `error: server does not support accounting` and exit with status 2, so a script can tell that case from an error (status 1).
+
+- **`account-history [--since TIME] [--until TIME] [--kind KIND] [--pool POOL] [--limit N] [--before ID] [--json]`**
+  Calls `/account/history` and prints one row per entry, newest first. `TIME` is epoch seconds or ISO 8601, read as UTC when it has no zone, e.g. `2026-09-01` or `2026-09-01T12:00:00+02:00`. When there are more entries, the `--before` value for the next page goes to stderr. Exits as `account` does on a service without accounting.
 
 **Example usage**:
 
@@ -716,6 +812,10 @@ dut-control-client wipe
 
 # Hand this reservation back
 dut-control-client lease
+
+# How many tokens are left, and what was spent this month
+dut-control-client account
+dut-control-client account-history --since 2026-09-01 --kind charge
 ```
 
 ### dut-control-admin
