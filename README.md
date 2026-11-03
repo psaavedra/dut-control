@@ -145,6 +145,12 @@ accounting:
 
 The `default-*` values apply to every client without its own `quota`; see [Client configuration](#client-configuration). An unknown key or a bad value (a negative number, `token-minutes: 0`, a cost of 0, `recharge-hour-utc: 24`) makes the configuration fail to load, since a typo here would change what a team may spend.
 
+With accounting on, `/power`, `/flash` and `/wipe` also log each call on a valid reservation to the `activity_events` table of the database, success or failure. They cost no tokens. A row has the account, the pool and DUT of the reservation, the result and, for a failure, the error cut at its first colon, so a path that follows it is not kept. The metadata is `action` for `/power`; `mode` (`named` or `upload`), the bare `image-name` and, for an upload, `bmap` for `/flash`; `size-bytes` for `/wipe`. Neither the reservation token nor an image path is stored. `/dut/status` is not logged, so `wait` adds nothing. There is no endpoint for this table yet; read it with `sqlite3`:
+
+```bash
+sqlite3 accounting.sqlite3 "SELECT datetime(ts, 'unixepoch'), account_id, action, dut_name, result, error FROM activity_events ORDER BY id DESC LIMIT 20"
+```
+
 ### Client configuration
 
 Clients are defined under `clients/*.yml`.
