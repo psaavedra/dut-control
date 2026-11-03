@@ -2622,3 +2622,118 @@ def test_a_reservation_outlives_its_pool_policy(flask_client, monkeypatch):
     assert flask_client.post("/lease", json=body).get_json() == {"status": 0}
     assert server_mod.processes == []
     assert server_mod.reserves[0]["valid-until"] <= int(time.time())
+
+
+# ---------------------------------------------------------------------------
+# Accounting and quota configuration
+# ---------------------------------------------------------------------------
+
+def _load_conf_with(tmp_path, accounting_lines=""):
+    (tmp_path / "conf.yml").write_text(
+        f"---\nadmin-key: admin\n{accounting_lines}\n")
+    return server_mod._load_conf(tmp_path)["accounting"]
+
+
+def test_load_conf_keeps_accounting_off_without_the_section(tmp_path,
+                                                            monkeypatch):
+    monkeypatch.delenv("DUT_CONTROL_STATE_DIR", raising=False)
+
+    acc = _load_conf_with(tmp_path)
+
+    assert acc["enabled"] is False
+    assert acc["enforcement"] == "observe"
+    assert acc["default-balance-cap"] == acc["default-monthly-token-limit"]
+    assert acc["database"] == str(tmp_path / "accounting.sqlite3")
+
+
+def test_load_conf_reads_the_accounting_section(tmp_path, monkeypatch):
+    monkeypatch.setenv("DUT_CONTROL_STATE_DIR", "/var/lib/dut-control")
+
+    acc = _load_conf_with(tmp_path, """accounting:
+  - enabled: true
+  - enforcement: reject
+  - default-monthly-token-limit: 80
+  - recharge-weekday: 7
+  - pool-costs:
+      rpi4: 1
+      rpi5-fast: 2.5""")
+
+    assert acc["enabled"] is True
+    assert acc["enforcement"] == "reject"
+    assert acc["default-balance-cap"] == 80
+    assert acc["recharge-weekday"] == 7
+    assert acc["pool-costs"] == {"rpi4": 1, "rpi5-fast": 2.5}
+    assert acc["database"] == "/var/lib/dut-control/accounting.sqlite3"
+
+
+@pytest.mark.parametrize("line, match", [
+    ("  - enable: true", "unknown keys: enable"),
+    ("  - enabled: maybe", "enabled"),
+    ("  - enforcement: block", "enforcement"),
+    ("  - token-minutes: 0", "token-minutes"),
+    ("  - recharge-hour-utc: 24", "recharge-hour-utc"),
+    ("  - pool-costs:\n      rpi4: 0", "pool-costs rpi4"),
+])
+def test_load_conf_rejects_a_bad_accounting_value(tmp_path, line, match):
+    with pytest.raises(ValueError, match=match):
+        _load_conf_with(tmp_path, f"accounting:\n{line}")
+
+
+def test_load_clients_leaves_account_and_quota_out_when_not_configured(
+        tmp_path):
+    _write_client_yaml(tmp_path / "clients")
+
+    client = server_mod._load_clients(tmp_path)[0]
+    assert "account-id" not in client
+    assert "quota" not in client
+
+
+def test_load_clients_reads_account_and_quota(tmp_path):
+    _write_client_yaml(tmp_path / "clients", """  account-id: team-browser
+  quota:
+    - monthly-token-limit: 80
+    - max-active-reservations: 2
+    - pool-concurrency:
+        rpi5-fast: 1
+    - reserve-rate:
+        - requests: 10
+        - window-seconds: 60""")
+
+    client = server_mod._load_clients(tmp_path)[0]
+    assert client["account-id"] == "team-browser"
+    assert client["quota"] == {
+        "enabled": True,
+        "monthly-token-limit": 80,
+        "max-active-reservations": 2,
+        "pool-concurrency": {"rpi5-fast": 1},
+        "reserve-rate": {"requests": 10, "window-seconds": 60},
+    }
+
+
+@pytest.mark.parametrize("quota, match", [
+    ("    - monthly-limit: 80", "unknown keys: monthly-limit"),
+    ("    - balance-cap: -1", "balance-cap"),
+    ("    - max-active-reservations: 1.5", "max-active-reservations"),
+    ("    - pool-concurrency:\n        rpi5: 0", "pool-concurrency rpi5"),
+    ("    - reserve-rate:\n        requests: 10", "window-seconds"),
+])
+def test_load_clients_rejects_a_bad_quota(tmp_path, quota, match):
+    _write_client_yaml(tmp_path / "clients", f"  quota:\n{quota}")
+
+    with pytest.raises(ValueError, match=match):
+        server_mod._load_clients(tmp_path)
+
+
+def test_load_clients_rejects_one_account_with_two_quotas(tmp_path):
+    clients_dir = tmp_path / "clients"
+    _write_client_yaml(clients_dir, """  account-id: team
+  quota:
+    - balance-cap: 10""")
+    (clients_dir / "client-02.yml").write_text("""
+- name: client-02
+  key: client-key-02
+  account-id: team
+""")
+
+    with pytest.raises(ValueError, match="account team"):
+        server_mod._load_clients(tmp_path)
