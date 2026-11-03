@@ -485,6 +485,56 @@ def test_reserve_no_free_ports(flask_client, monkeypatch):
     assert "no free ports for client" in data["error"]
 
 
+@pytest.mark.parametrize("duts, port_to", [(1, 5001), (2, 5000)],
+                         ids=["one-dut", "one-port"])
+def test_reserve_concurrent_calls_do_not_share(monkeypatch, duts, port_to):
+    client = _make_client(port_from=5000, port_to=port_to)
+    node, _ = _make_node_dut(pool="pool-01")
+    node["duts"] += [dict(node["duts"][0], name=f"dut-{i:02}")
+                     for i in range(2, duts + 1)]
+
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+
+    def fake_start_ssh_tunnel(c, d, remote_port, token):
+        with server_mod.state_lock:
+            server_mod.processes.append({
+                "reserve-token": token,
+                "client-name": c["name"],
+                "ports-in-use": [remote_port],
+            })
+
+    # Hold both calls once they have picked a DUT and a port. With the
+    # lock, the second one waits for the first and the barrier times
+    # out; without it, both go on with the same pick.
+    barrier = threading.Barrier(2, timeout=0.5)
+    find_free_port = server_mod._find_free_port_for_client
+
+    def slow_find_free_port(c):
+        port = find_free_port(c)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return port
+
+    monkeypatch.setattr(server_mod, "_start_ssh_tunnel", fake_start_ssh_tunnel)
+    monkeypatch.setattr(
+        server_mod, "_find_free_port_for_client", slow_find_free_port)
+
+    def post(_):
+        return server_mod.server.test_client().post(
+            "/reserve",
+            json={"client-key": client["key"], "pool": "pool-01"},
+        ).get_json()["status"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = sorted(pool.map(post, range(2)))
+
+    assert statuses == [-4, 0]
+
+
 # ---------------------------------------------------------------------------
 # /lease endpoint
 # ---------------------------------------------------------------------------
