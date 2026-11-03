@@ -13,6 +13,7 @@ grow a dependency.
 import calendar
 import hashlib
 import hmac
+import json
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -378,6 +379,28 @@ class AccountingStore:
             self._entry(conn, event_id, now, account, "admin", amount,
                         actor=actor, reason=reason)
             return self._summary(self._row(conn, account), policy, now)
+
+    def record_activity(self, now: int, *, account: str, token: str,
+                        action: str, dut_name: str, result: str,
+                        error: str = None, metadata: dict = None):
+        """
+        Log one action on a reserved DUT; it costs nothing. The account
+        and the pool come from the charge of the reservation when there
+        is one, so they match the ledger.
+        """
+        token_hash = self.token_hash(token)
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO activity_events (ts, account_id, "
+                "reservation_token_hash, action, pool, dut_name, result, "
+                "error, metadata_json) VALUES (?, COALESCE((SELECT "
+                "account_id FROM reservation_charges WHERE "
+                "reservation_token_hash = ?), ?), ?, ?, (SELECT pool FROM "
+                "reservation_charges WHERE reservation_token_hash = ?), "
+                "?, ?, ?, ?)",
+                (now, token_hash, account, token_hash, action, token_hash,
+                 dut_name, result, error,
+                 json.dumps(metadata or {}, sort_keys=True)))
 
     def report(self, *, since: int = None, until: int = None,
                account: str = None, pool: str = None) -> list:
