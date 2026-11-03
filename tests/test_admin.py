@@ -69,3 +69,15 @@ def test_account_report_prints_csv(answers, capsys):
     assert capsys.readouterr().out.splitlines() == [
         "account-id,pool,kind,entries,tokens,minutes",
         "team,rpi5,charge,2,-4.0,240"]
+
+
+def test_account_activity_sends_only_the_filters_given(answers):
+    calls = answers({"result": 0, "events": [], "next-before": None})
+
+    assert admin_mod.main(["account-activity", "--action", "flash",
+                           "--client", "client-01"]) == 0
+
+    url, payload = calls[0]
+    assert url.endswith("/conf/account/activity")
+    assert payload == {"admin-key": "an-admin-key", "client": "client-01",
+                       "action": "flash"}
