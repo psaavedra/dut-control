@@ -1129,7 +1129,26 @@ def _refund_reserves(tokens: set[str], now: int):
 @validate_client
 def pools():
     """List reservable pools with their enabled and free DUT counts."""
-    return jsonify({"status": 0, "pools": _list_pools(request.client)}), 200
+    listing = _list_pools(request.client)
+    store = accounting_store
+    if store is not None:
+        _add_pool_prices(store, request.client, listing, _now_epoch())
+    return jsonify({"status": 0, "pools": listing}), 200
+
+
+def _add_pool_prices(store, client: dict, listing: list, now: int):
+    """What a reservation in each pool costs, and whether the balance
+    of the client's account covers it."""
+    balance = store.settle(
+        _account_id(client), _account_policy(client), now)["balance"]
+    for entry in listing:
+        price = _reservation_price(entry["name"])
+        entry.update({
+            "token-cost": accounting_conf["pool-costs"].get(entry["name"], 1),
+            "reservation-minutes": RESERVATION_MINUTES,
+            "reservation-tokens": accounting.to_tokens(price),
+            "affordable": balance >= price,
+        })
 
 
 @server.route("/reserve", methods=["POST", "PUT"])
