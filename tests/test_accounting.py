@@ -163,3 +163,31 @@ def test_the_database_never_holds_a_reservation_token(store, tmp_path):
     wal = tmp_path / "accounting.sqlite3-wal"
     data += wal.read_bytes() if wal.exists() else b""
     assert b"secret-reservation-token" not in data
+
+
+def test_an_admin_key_is_per_account_and_can_set_a_target(store):
+    now = _ts(2026, 6, 3)
+
+    for account in ("team", "other"):
+        info = store.credit(account, POLICY, now, amount=5 * MILLI,
+                            reason="demo", idempotency_key="k1",
+                            actor="admin")
+        assert info["balance"] == 15 * MILLI
+
+    info = store.credit("team", POLICY, now, target=3 * MILLI,
+                        reason="reset", idempotency_key="k2", actor="admin")
+    assert info["balance"] == 3 * MILLI
+
+
+def test_report_adds_up_by_account_pool_and_kind(store):
+    now = _ts(2026, 6, 3)
+    _charge(store, now, token="t1")
+    _charge(store, now + 60, token="t2")
+    store.refund("t2", now + 60)
+    store.settle("other", POLICY, now)
+
+    rows = store.report(since=now, account="team", pool="rpi5")
+
+    assert [(r["kind"], r["entries"], r["amount"], r["minutes"])
+            for r in rows] == [("charge", 2, -4 * MILLI, 240),
+                               ("refund", 1, 2 * MILLI, 0)]
