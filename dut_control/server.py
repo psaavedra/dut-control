@@ -326,10 +326,11 @@ def _normalize_accounting(value, config_dir: Path) -> dict:
     acc["token-minutes"] = _config_number(
         acc["token-minutes"], "accounting token-minutes",
         integer=True, positive=True)
-    acc.setdefault("default-balance-cap", acc["default-monthly-token-limit"])
+    # No default-balance-cap means the monthly limit of each account.
     for key in ("default-monthly-token-limit",
                 "default-weekly-recharge-tokens", "default-balance-cap"):
-        acc[key] = _config_number(acc[key], f"accounting {key}")
+        if key in acc:
+            acc[key] = _config_number(acc[key], f"accounting {key}")
     acc["recharge-weekday"] = _config_int_between(
         acc["recharge-weekday"], "accounting recharge-weekday", 1, 7)
     acc["recharge-hour-utc"] = _config_int_between(

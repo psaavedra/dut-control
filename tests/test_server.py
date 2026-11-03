@@ -2642,7 +2642,7 @@ def test_load_conf_keeps_accounting_off_without_the_section(tmp_path,
 
     assert acc["enabled"] is False
     assert acc["enforcement"] == "observe"
-    assert acc["default-balance-cap"] == acc["default-monthly-token-limit"]
+    assert "default-balance-cap" not in acc
     assert acc["database"] == str(tmp_path / "accounting.sqlite3")
 
 
@@ -2660,7 +2660,6 @@ def test_load_conf_reads_the_accounting_section(tmp_path, monkeypatch):
 
     assert acc["enabled"] is True
     assert acc["enforcement"] == "reject"
-    assert acc["default-balance-cap"] == 80
     assert acc["recharge-weekday"] == 7
     assert acc["pool-costs"] == {"rpi4": 1, "rpi5-fast": 2.5}
     assert acc["database"] == "/var/lib/dut-control/accounting.sqlite3"

@@ -137,7 +137,7 @@ accounting:
 | `token-minutes` | `120` | Minutes of reservation that one token pays for in a pool of cost 1. |
 | `default-monthly-token-limit` | `40` | Most tokens the weekly recharges give in one calendar month (UTC). |
 | `default-weekly-recharge-tokens` | `10` | Tokens added at each weekly recharge. |
-| `default-balance-cap` | the monthly limit | Most tokens an account can hold. |
+| `default-balance-cap` | the monthly limit of the account | Most tokens an account can hold. |
 | `recharge-weekday` | `1` | ISO day of the recharge, 1 (Monday) to 7 (Sunday). |
 | `recharge-hour-utc` | `0` | Hour of the recharge, 0 to 23, in UTC. |
 | `database` | `accounting.sqlite3` in `DUT_CONTROL_STATE_DIR`, else in the config directory | Where the balances and the history are kept. |
