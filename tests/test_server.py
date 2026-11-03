@@ -2736,3 +2736,113 @@ def test_load_clients_rejects_one_account_with_two_quotas(tmp_path):
 
     with pytest.raises(ValueError, match="account team"):
         server_mod._load_clients(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Accounting of reservations
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def accounting_on(tmp_path, monkeypatch):
+    """Accounting on, rpi5 at cost 2; a new account opens with 10."""
+    conf = server_mod._normalize_accounting(
+        [{"enabled": True}, {"pool-costs": {"rpi5": 2}},
+         {"database": str(tmp_path / "accounting.sqlite3")}], tmp_path)
+    store = server_mod._open_store(conf)
+    monkeypatch.setattr(server_mod, "accounting_conf", conf)
+    monkeypatch.setattr(server_mod, "accounting_store", store)
+    return store
+
+
+def _one_shared_dut_setup():
+    """client-01 and one DUT in both rpi4 and rpi5."""
+    client = _make_client()
+    node = {"name": "node-01", "ssh": {"ip": "192.0.2.20"},
+            "duts": [_make_pool_dut("dut-01", ["rpi4", "rpi5"])]}
+    with server_mod.state_lock:
+        server_mod.clients[:] = [client]
+        server_mod.nodes[:] = [node]
+    return client
+
+
+def _reserve_json(flask_client, client, pool="rpi5"):
+    return flask_client.post(
+        "/reserve", json={"client-key": client["key"], "pool": pool},
+    ).get_json()
+
+
+def test_reserve_answers_as_before_with_accounting_off(flask_client,
+                                                       monkeypatch):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+
+    assert set(_reserve_json(flask_client, client)) == {
+        "status", "token", "dut-name", "ip", "ssh-port", "tunnel-ssh-port",
+        "client-ssh-overrides"}
+
+
+@pytest.mark.parametrize("pool, charged", [("rpi4", 1.0), ("rpi5", 2.0)])
+def test_reserve_charges_the_pool_asked_for(flask_client, monkeypatch,
+                                            accounting_on, pool, charged):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+
+    data = _reserve_json(flask_client, client, pool)
+
+    assert data["status"] == 0
+    assert data["account-id"] == "client-01"
+    assert data["charged-tokens"] == charged
+    assert data["tokens-available"] == 10 - charged
+    assert data["valid-until"] == server_mod.reserves[0]["valid-until"]
+
+
+def test_reserve_gives_the_charge_back_when_the_tunnel_fails(
+        flask_client, monkeypatch, accounting_on):
+    client = _one_shared_dut_setup()
+
+    def failing_tunnel(*args):
+        raise OSError("no ssh")
+
+    monkeypatch.setattr(server_mod, "_start_ssh_tunnel", failing_tunnel)
+
+    assert _reserve_json(flask_client, client)["status"] == -99
+
+    assert server_mod.reserves == []
+    kinds = [r["kind"] for r in accounting_on.history("client-01")]
+    assert kinds == ["reserve-rollback", "charge", "recharge"]
+
+
+def test_lease_refunds_an_early_release_once(flask_client, monkeypatch,
+                                             accounting_on):
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    token = _reserve_json(flask_client, client)["token"]
+
+    for _ in range(2):
+        flask_client.post(
+            "/lease", json={"client-key": client["key"], "token": token})
+
+    refunds = accounting_on.history("client-01", kind="refund")
+    assert len(refunds) == 1
+    # Released at once: 119 or 120 of the 120 minutes come back.
+    assert refunds[0]["amount_millitokens"] >= 2000 * 119 // 120
+
+
+def test_account_policy_puts_the_quota_over_the_defaults(accounting_on):
+    default = server_mod._account_policy(_make_client())
+    own = server_mod._account_policy(
+        dict(_make_client(), quota={"monthly-token-limit": 80}))
+
+    assert (default.monthly_limit, default.balance_cap) == (40000, 40000)
+    assert (own.monthly_limit, own.balance_cap) == (80000, 80000)
+    assert own.weekly_recharge == 10000
+
+
+def test_open_store_keeps_the_store_of_the_same_file(accounting_on,
+                                                     tmp_path):
+    conf = server_mod.accounting_conf
+
+    assert server_mod._open_store(conf) is accounting_on
+    assert server_mod._open_store(dict(conf, enabled=False)) is None
+    other = dict(conf, database=str(tmp_path / "other.sqlite3"))
+    assert server_mod._open_store(other).path == other["database"]
