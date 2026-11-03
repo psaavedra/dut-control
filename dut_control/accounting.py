@@ -357,16 +357,20 @@ class AccountingStore:
         """Give back the whole charge of a reservation that never ran."""
         return self._give_back(token, now, "reserve-rollback", whole=True)
 
-    def credit(self, account: str, policy: Policy, now: int, *, amount: int,
-               reason: str, idempotency_key: str, actor: str) -> dict:
+    def credit(self, account: str, policy: Policy, now: int, *,
+               reason: str, idempotency_key: str, actor: str,
+               amount: int = 0, target: int = None) -> dict:
         """
-        An admin change of the balance, up or down. The same key applies
-        once. It is not a recharge, so it ignores the cap and the
-        monthly limit; it cannot take the balance below zero.
+        An admin change of the balance: by ``amount``, up or down, or to
+        ``target``. The same key applies once per account. It is not a
+        recharge, so it ignores the cap and the monthly limit; it cannot
+        take the balance below zero.
         """
         with self._transaction() as conn:
             row = self._settle(conn, account, policy, now)
-            event_id = f"admin:{idempotency_key}"
+            if target is not None:
+                amount = target - row["balance"]
+            event_id = f"admin:{account}:{idempotency_key}"
             seen = conn.execute("SELECT 1 FROM ledger WHERE event_id = ?",
                                 (event_id,)).fetchone()
             if not seen and row["balance"] + amount < 0:
@@ -374,6 +378,29 @@ class AccountingStore:
             self._entry(conn, event_id, now, account, "admin", amount,
                         actor=actor, reason=reason)
             return self._summary(self._row(conn, account), policy, now)
+
+    def report(self, *, since: int = None, until: int = None,
+               account: str = None, pool: str = None) -> list:
+        """
+        Ledger totals by account, pool and kind: how many entries, how
+        many millitokens, and how many minutes were reserved.
+        """
+        filters = {"ts >= ?": since, "ts < ?": until,
+                   "account_id = ?": account, "pool = ?": pool}
+        where = [k for k, v in filters.items() if v is not None] or ["1"]
+        args = [v for v in filters.values() if v is not None]
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT account_id, pool, kind, COUNT(*) AS entries, "
+                "SUM(amount_millitokens) AS amount, "
+                "COALESCE(SUM(minutes), 0) AS minutes FROM ledger "
+                f"WHERE {' AND '.join(where)} "
+                "GROUP BY account_id, pool, kind "
+                "ORDER BY account_id, pool, kind", args)
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     def history(self, account: str, *, since: int = None, until: int = None,
                 kind: str = None, pool: str = None, before: int = None,
