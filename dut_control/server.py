@@ -259,6 +259,7 @@ _ACCOUNTING_DEFAULTS = {
     "recharge-weekday": 1,
     "recharge-hour-utc": 0,
     "pool-costs": {},
+    "strict-pool-costs": False,
 }
 _ACCOUNTING_KEYS = {*_ACCOUNTING_DEFAULTS, "default-balance-cap", "database"}
 
@@ -330,6 +331,8 @@ def _normalize_accounting(value, config_dir: Path) -> dict:
     acc = {**_ACCOUNTING_DEFAULTS, **section}
 
     acc["enabled"] = _config_bool(acc["enabled"], "accounting enabled")
+    acc["strict-pool-costs"] = _config_bool(
+        acc["strict-pool-costs"], "accounting strict-pool-costs")
     if acc["enforcement"] not in _ENFORCEMENT_MODES:
         raise ValueError("accounting enforcement must be one of "
                          + ", ".join(_ENFORCEMENT_MODES))
@@ -511,6 +514,35 @@ def _conf_int(conf: dict, key: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _mixed_cost_duts(nodes: list, costs: dict) -> list[str]:
+    """The DUTs in pools of different costs, each with its prices."""
+    found = []
+    for node in nodes:
+        for dut in node.get("duts", []):
+            prices = {p: costs.get(p, 1) for p in _dut_pools(dut)}
+            if len(set(prices.values())) > 1:
+                found.append(f"{dut['name']} (" + ", ".join(
+                    f"{p}={c:g}" for p, c in prices.items()) + ")")
+    return found
+
+
+def _check_pool_costs(conf: dict, nodes: list):
+    """
+    A DUT is priced by the pool it is reserved through, so a DUT in a
+    cheap and an expensive pool can be had at the cheap price. Warn about it,
+    or refuse the configuration with strict-pool-costs.
+    """
+    if not conf["enabled"]:
+        return
+    mixed = _mixed_cost_duts(nodes, conf["pool-costs"])
+    if not mixed:
+        return
+    message = "DUTs in pools of different costs: " + "; ".join(mixed)
+    if conf["strict-pool-costs"]:
+        raise ValueError(message)
+    server.logger.warning(message)
+
+
 def _open_store(conf: dict):
     """The store for an accounting section; the open one if it is the
     same file, so a reload does not reopen it."""
@@ -535,6 +567,7 @@ def reload_config():
     new_clients = _load_clients(CONFIG_DIR)
     max_upload = _conf_int(conf, "max-upload-bytes", MAX_UPLOAD_BYTES)
     max_lifetime = _conf_int(conf, "max-reserve-lifetime", 0)
+    _check_pool_costs(conf["accounting"], new_nodes)
     new_store = _open_store(conf["accounting"])
 
     with state_lock:
