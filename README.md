@@ -740,6 +740,37 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
   Enables or disables a DUT at runtime. Body: `dut-name` (string, required) and `enabled` (boolean, required), plus `admin-key`. Returns `{"result": 0, "dut-name": ..., "enabled": ...}` on success, `{"result": -1, "error": ...}` for a missing `dut-name` or non-boolean `enabled`, and `{"result": -2, "error": "dut not found"}` for an unknown DUT.
   Disabled DUTs are excluded from pool lookups so they cannot be reserved; existing reservations keep working. The change is in-memory only: `/conf/reload` or a service restart reverts to the `enabled` value from the YAML configuration.
 
+### Admin: accounts
+
+These endpoints manage the [accounting](#accounting). An account is named by one of its clients, in `client`, since the quota of the account comes from the client configuration. They return `{"result": -10, "error": "accounting is off"}` when accounting is off, and `{"result": -1, "error": "client not found"}` for an unknown client.
+
+- **`POST /conf/account/info`**
+  Body: `client`. Returns what [`/account`](#account-account) returns, plus `enforcement` (the mode that applies to the account) and `clients` (every client of the account).
+
+- **`POST /conf/account/recharge`**
+  Body: `client`, `tokens` (a number; negative takes tokens away), `reason` and `idempotency-key` (both non-empty strings). Adds the tokens and returns the account as `info` does. The same key applies once per account, so a request that timed out can be sent again. An admin credit is not a recharge: it ignores the cap and the monthly limit. A missing field, or a change that would take the balance below zero, returns `result = -2`.
+
+- **`POST /conf/account/set-balance`**
+  As `recharge`, but `tokens` (zero or more) is the new balance. The ledger keeps the difference, with the reason.
+
+- **`POST /conf/account/ledger`**
+  Body: `client`, plus the filters of [`/account/history`](#account-history-accounthistory). Returns the same page; a bad filter returns `result = -2`.
+
+- **`POST /conf/account/report`**
+  Body: `since` and `until` (epoch seconds), `client` and `pool`, all optional. Returns the ledger totals by account, pool and kind:
+
+  ```json
+  {
+    "result": 0,
+    "rows": [
+      {"account-id": "team-browser", "pool": "rpi5", "kind": "charge",
+       "entries": 12, "tokens": -24.0, "minutes": 1440}
+    ]
+  }
+  ```
+
+  `minutes` is the reserved time of the charges. Refunds are in their own row, so the time used is the charged time less what the refunds gave back.
+
 ## CLI tools
 
 ### dut-control-client
@@ -899,6 +930,20 @@ dut-control-client account-history --since 2026-09-01 --kind charge
 - **`dut-enable <dut-name>`** / **`dut-disable <dut-name>`**
   Calls `/conf/dut/enabled` to enable or disable a DUT at runtime and prints the JSON response; exits with status 1 if the service reports an error (e.g. unknown DUT). The change lasts until the next `reload` or service restart.
 
+- **`account <client>`**
+  Calls `/conf/account/info` and prints the account of the client as JSON
+
+- **`recharge <client> --tokens N --reason TEXT [--idempotency-key KEY]`** / **`set-balance <client> --tokens N --reason TEXT [--idempotency-key KEY]`**
+  Calls `/conf/account/recharge` or `/conf/account/set-balance`. Without `--idempotency-key`, a new UUID is used; pass your own to retry a call safely
+
+- **`account-ledger <client> [--since TIME] [--until TIME] [--pool POOL] [--kind KIND] [--limit N] [--before ID]`**
+  Calls `/conf/account/ledger` and prints the page as JSON
+
+- **`account-report [--since TIME] [--until TIME] [--pool POOL] [--client NAME] [--format table|json|csv]`**
+  Calls `/conf/account/report` and prints the totals as a table (default), JSON, or CSV with a header row
+
+`TIME` is epoch seconds or ISO 8601, as for `dut-control-client`. The account subcommands exit with status 1, after printing the answer, when the service refuses the call.
+
 **Example**:
 
 ```bash
@@ -917,6 +962,10 @@ dut-control-admin prune
 # Take a misbehaving DUT out of rotation, then bring it back
 dut-control-admin dut-disable rpi5-03
 dut-control-admin dut-enable rpi5-03
+
+# Give a team 10 more tokens, and see what was spent in September
+dut-control-admin recharge client-01 --tokens 10 --reason "release week"
+dut-control-admin account-report --since 2026-09-01 --until 2026-10-01 --format csv
 ```
 
 ## Testing
