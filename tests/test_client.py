@@ -594,3 +594,14 @@ def test_a_time_is_an_epoch_or_iso_8601_in_utc(given):
 def test_a_time_that_is_not_a_time_is_refused():
     with pytest.raises(client_mod.argparse.ArgumentTypeError):
         client_mod._epoch("yesterday")
+
+
+def test_pools_prints_one_json_object(answers, capsys):
+    listing = {"status": 0, "pools": [
+        {"name": "rpi5", "enabled-duts": 3, "free-duts": 1,
+         "token-cost": 2, "reservation-tokens": 2.0, "affordable": True}]}
+    answers(listing)
+
+    assert client_mod.main(["pools", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == listing
