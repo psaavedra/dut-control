@@ -145,11 +145,7 @@ accounting:
 
 The `default-*` values apply to every client without its own `quota`; see [Client configuration](#client-configuration). An unknown key or a bad value (a negative number, `token-minutes: 0`, a cost of 0, `recharge-hour-utc: 24`) makes the configuration fail to load, since a typo here would change what a team may spend.
 
-With accounting on, `/power`, `/flash` and `/wipe` also log each call on a valid reservation to the `activity_events` table of the database, success or failure. They cost no tokens. A row has the account, the pool and DUT of the reservation, the result and, for a failure, the error cut at its first colon, so a path that follows it is not kept. The metadata is `action` for `/power`; `mode` (`named` or `upload`), the bare `image-name` and, for an upload, `bmap` for `/flash`; `size-bytes` for `/wipe`. Neither the reservation token nor an image path is stored. `/dut/status` is not logged, so `wait` adds nothing. There is no endpoint for this table yet; read it with `sqlite3`:
-
-```bash
-sqlite3 accounting.sqlite3 "SELECT datetime(ts, 'unixepoch'), account_id, action, dut_name, result, error FROM activity_events ORDER BY id DESC LIMIT 20"
-```
+With accounting on, `/power`, `/flash` and `/wipe` also log each call on a valid reservation to the `activity_events` table of the database, success or failure. They cost no tokens. A row has the account, the pool and DUT of the reservation, the result and, for a failure, the error cut at its first colon, so a path that follows it is not kept. The metadata is `action` for `/power`; `mode` (`named` or `upload`), the bare `image-name` and, for an upload, `bmap` for `/flash`; `size-bytes` for `/wipe`. Neither the reservation token nor an image path is stored. `/dut/status` is not logged, so `wait` adds nothing. Read the log with [`/conf/account/activity`](#admin-accounts) or `dut-control-admin account-activity`.
 
 ### Client configuration
 
@@ -777,6 +773,25 @@ These endpoints manage the [accounting](#accounting). An account is named by one
 
   `minutes` is the reserved time of the charges. Refunds are in their own row, so the time used is the charged time less what the refunds gave back.
 
+- **`POST /conf/account/activity`**
+  Body: `client` (optional; every account without it), `action` (`power`, `flash` or `wipe`) and `pool`, plus `since`, `until`, `limit` and `before` as for [`/account/history`](#account-history-accounthistory). Returns the logged calls, newest first, paged the same way:
+
+  ```json
+  {
+    "result": 0,
+    "events": [
+      {"id": 42, "ts": 1790600000, "ts-iso": "2026-09-27T15:33:20Z",
+       "account-id": "team-browser", "action": "flash", "pool": "rpi5",
+       "dut-name": "rpi5-01", "result": "failed",
+       "error": "flash command failed on node",
+       "metadata": {"mode": "upload", "image-name": "rpi5.wic", "bmap": true}}
+    ],
+    "next-before": null
+  }
+  ```
+
+  A bad filter returns `result = -2`.
+
 ## CLI tools
 
 ### dut-control-client
@@ -944,6 +959,9 @@ dut-control-client account-history --since 2026-09-01 --kind charge
 
 - **`account-ledger <client> [--since TIME] [--until TIME] [--pool POOL] [--kind KIND] [--limit N] [--before ID]`**
   Calls `/conf/account/ledger` and prints the page as JSON
+
+- **`account-activity [--client NAME] [--action power|flash|wipe] [--since TIME] [--until TIME] [--pool POOL] [--limit N] [--before ID]`**
+  Calls `/conf/account/activity` and prints the page as JSON
 
 - **`account-report [--since TIME] [--until TIME] [--pool POOL] [--client NAME] [--format table|json|csv]`**
   Calls `/conf/account/report` and prints the totals as a table (default), JSON, or CSV with a header row
