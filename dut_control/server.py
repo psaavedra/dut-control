@@ -32,6 +32,9 @@ MAX_UPLOAD_BYTES = 8 * 1024 ** 3
 # Enough to take out the partition table, /boot and the head of the
 # rootfs on the usual layouts.
 WIPE_DEFAULT_BYTES = 128 * _MIB
+# A reservation lasts this long, and /renew pushes its end this far
+# from now, up to max-reserve-lifetime in conf.yml.
+RESERVE_SECONDS = 2 * 3600
 
 _SSH_SKIP_HOST_CHECK = [
     "-o", "StrictHostKeyChecking=no",
@@ -326,7 +329,8 @@ def _load_clients(config_dir: Path):
 
 def reload_config():
     """
-    Reload admin_key, nodes, clients from YAML.
+    Reload admin_key, nodes, clients, and the upload and reserve
+    lifetime limits from YAML.
     Does NOT touch reserves/processes.
     """
     global admin_key, nodes, clients
@@ -339,6 +343,8 @@ def reload_config():
         admin_key = conf["admin-key"]
         server.config["MAX_CONTENT_LENGTH"] = int(
             conf.get("max-upload-bytes", MAX_UPLOAD_BYTES))
+        server.config["MAX_RESERVE_LIFETIME"] = int(
+            conf.get("max-reserve-lifetime", 0))
         nodes[:] = new_nodes
         clients[:] = new_clients
 
@@ -385,6 +391,12 @@ def _dut_pools(dut: dict) -> list[str]:
 
 def _dut_in_pool(dut: dict, pool: str) -> bool:
     return pool in _dut_pools(dut)
+
+
+def _dut_still_offered(client: dict, dut: dict) -> bool:
+    """The DUT is enabled and in a pool the client may use."""
+    return _dut_enabled(dut) and any(
+        _client_can_access_pool(client, pool) for pool in _dut_pools(dut))
 
 
 def _pool_exists(pool: str) -> bool:
@@ -817,8 +829,9 @@ def conf_dut_enabled():
     """
     Enable/disable a DUT at runtime. Disabled DUTs are excluded from pool
     lookups (so they cannot be reserved) but existing reservations keep
-    working. The change lives in memory only: /conf/reload or a restart
-    reverts to the YAML value.
+    working until they end; /renew no longer extends them. The change
+    lives in memory only: /conf/reload or a restart reverts to the YAML
+    value.
     """
     body = request.get_json(silent=True) or {}
     if not _check_admin_key_from_body(body):
@@ -891,7 +904,7 @@ def reserve():
     reserve_entry = {
         "token": token,
         "valid-from": now,
-        "valid-until": now + 2 * 3600,  # 2 hours
+        "valid-until": now + RESERVE_SECONDS,
         "client-key": request.client["key"],
         "dut-name": dut["name"],
     }
@@ -1005,6 +1018,51 @@ def lease():
 
     except Exception as e:
         return _error_response(-99, f"internal error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# /renew
+# ---------------------------------------------------------------------------
+
+@server.route("/renew", methods=["POST", "PUT"])
+@validate_client
+@validate_token
+def renew():
+    """Move the end of a reservation of the client to RESERVE_SECONDS
+    from now, up to max-reserve-lifetime from its start."""
+    with state_lock:
+        # Again under the lock, after validate_token.
+        now = _now_epoch()
+        reserve_entry = _get_reserve_by_token(_request_token())
+        if (not reserve_entry or
+                reserve_entry.get("valid-until", 0) < now):
+            return _error_response(-2, "token expired")
+        client = _get_client_by_key(request.client["key"])
+        if not client:
+            return _error_response(-1, "client key is not valid")
+        if reserve_entry.get("client-key") != client["key"]:
+            return _error_response(-1, "token is not valid")
+        # A lifetime of RESERVE_SECONDS or less could never move the end.
+        lifetime = server.config["MAX_RESERVE_LIFETIME"]
+        if lifetime <= RESERVE_SECONDS:
+            return _error_response(-6, "renew is disabled")
+
+        _, dut = _get_dut_and_node_by_name(reserve_entry["dut-name"])
+        if not dut:
+            return _error_response(-99, "dut not found")
+        if not _dut_still_offered(client, dut):
+            return _error_response(
+                -6, "dut is disabled or not in an allowed pool")
+
+        cap = reserve_entry["valid-from"] + lifetime
+        if cap <= reserve_entry["valid-until"]:
+            return _error_response(-6, "reservation lifetime reached")
+        # Never earlier than the current end.
+        until = max(reserve_entry["valid-until"],
+                    min(now + RESERVE_SECONDS, cap))
+        reserve_entry["valid-until"] = until
+
+    return jsonify({"status": 0, "valid-until": until}), 200
 
 
 # ---------------------------------------------------------------------------
