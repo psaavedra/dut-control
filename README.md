@@ -16,7 +16,7 @@ Core pieces:
 
 ## Features
 
-- DUT reservation by pool with time-limited tokens
+- DUT reservation by pool with time-limited tokens, which a client can renew up to a configured lifetime
 - Automatic reverse SSH tunnel setup from the service to the client to expose the DUT SSH port on a client port
 - Client SSH address/port overrides announced per request, for clients behind NAT or with a dynamic address
 - Lease/cleanup of reservations, including process and port management
@@ -104,9 +104,12 @@ dut-control/
 ---
 admin-key: 6bdb3138229b7e45
 max-upload-bytes: 8589934592
+max-reserve-lifetime: 50400
 ```
 
-`max-upload-bytes` is optional and caps an uploaded image; it defaults to 8 GiB.
+`max-upload-bytes` is optional and caps an uploaded image; it defaults to 8 GiB. Flask applies it to every request body, so no value, 0 or a negative value also gives the default.
+
+`max-reserve-lifetime` is optional and caps how far `/renew` can extend a reservation, in seconds from `/reserve` (50400 is 14 hours); the first 2 hours do not change. Without it, or with a value of 7200 or less, which could never extend a reservation, renew is off and a reservation ends 2 hours after `/reserve`.
 
 The value of `admin-key` must be provided by admin clients when calling admin endpoints.
 
@@ -148,7 +151,7 @@ An optional `allowed-pools` list restricts which pools a client can list and res
 
 A client without the key, like `client-01` above, reaches every pool, so configurations written before the key keep working; `allowed-pools: []` denies every pool. The value must be a YAML list of pool names, and a scalar, a mapping, an empty entry or a bare `yes` (which YAML reads as a boolean) makes the configuration fail to load rather than quietly changing who can reach what. Repeated names are dropped. A name is not checked against the configured pools, since a pool may be added, removed or disabled later without making the policy invalid; a permitted pool that does not exist simply never shows up.
 
-The policy covers discovery and new reservations only: a reservation already handed out survives a `/conf/reload` that drops its pool, so its token can still be used and released. `/conf/info/clients` reports `allowed-pools` for the clients that have one.
+The policy covers discovery, new reservations and `/renew`: a reservation already handed out survives a `/conf/reload` that drops its pool, so its token can still be used and released until it ends, but `/renew` no longer extends it. `/conf/info/clients` reports `allowed-pools` for the clients that have one.
 
 `ssh.ip` and `ssh.port` are the address the service uses to reach the client back (reverse tunnel and image `scp`). A client that is not reachable at that address, typically because it sits behind NAT and only knows its public address and forwarded port at run time, can announce the right values on each request; see [Client SSH overrides](#client-ssh-overrides). Such a client still needs an `ssh` section in its YAML entry, if only for `user`; the announced values replace the configured ones in memory.
 
@@ -247,7 +250,7 @@ All API endpoints use JSON bodies and responses.
 
 ### Client SSH overrides
 
-Any endpoint that takes a `client-key` (`/pools`, `/reserve`, `/lease`), plus `/flash`, accepts two optional fields overriding the SSH parameters the service uses to connect back to the client:
+Any endpoint that takes a `client-key` (`/pools`, `/reserve`, `/lease`, `/renew`), plus `/flash`, accepts two optional fields overriding the SSH parameters the service uses to connect back to the client:
 
 - `client-ssh-ip` (string): address to use instead of the configured `ssh.ip`. An IPv4 or IPv6 literal, or a DNS name (dynamic DNS is the usual way a NATed client is addressed)
 - `client-ssh-port` (integer, or its decimal string form): port to use instead of the configured `ssh.port`, in the range 1-65535
@@ -314,7 +317,7 @@ On success, the service:
 
 - Selects a DUT from the pool that is not currently reserved
 - Finds a free port for the client in its configured `ports-range`
-- Creates a reservation token valid for 2 hours
+- Creates a reservation token valid for 2 hours, which `/renew` can extend up to `max-reserve-lifetime`
 - Starts an SSH reverse tunnel process toward the client
 
 **Success response** (HTTP 200):
@@ -370,6 +373,33 @@ On success the service:
 If no matching reservations exist, the service still returns `{"status": 0}`.
 
 Internal errors are returned as `{"status": -99, "error": "..."}`.
+
+### Renew: /renew
+
+Keep a reservation for longer, e.g. for a run of several hours.
+
+- **Method**: `POST` (or `PUT`)
+- **Path**: `/renew`
+- **Request body**:
+  - `client-key` (string, required)
+  - `token` (string, required): a reservation of this client
+  - `client-ssh-ip` / `client-ssh-port` (optional): taken as for every endpoint with a `client-key`, see [Client SSH overrides](#client-ssh-overrides): they are stored for the client and used by its next `/reserve` and `/flash`. Renew does not restart the SSH tunnel of the reservation, so that tunnel keeps its address
+
+On success, the service moves `valid-until` to 2 hours from now, but never past `valid-from` plus `max-reserve-lifetime` (see [conf.yml](#confyml)), and never earlier than it was: a renew right after `/reserve` keeps the end and still succeeds. Call it again before the reservation ends.
+
+**Success response**:
+
+```json
+{ "status": 0, "valid-until": 1767225600 }
+```
+
+**Error responses**:
+
+- `status = -1`: missing or invalid `client-key`, or a missing, unknown or other client's `token`
+- `status = -2`: the reservation already ended, or `/lease` released it
+- `status = -5`: invalid `client-ssh-ip` or `client-ssh-port`
+- `status = -6`: `reservation lifetime reached` once `max-reserve-lifetime` is used up; `renew is disabled` when it is not set or is 7200 or less; `dut is disabled or not in an allowed pool` when the DUT was disabled, by an admin or by the service after a failed `/flash` or `/wipe`, or no pool of the DUT is in the client's `allowed-pools` any more
+- `status = -99`: the DUT of the reservation is no longer in the configuration, as for `/power`
 
 ### Power control: /power/<on|off|cycle>
 
@@ -457,7 +487,7 @@ Step 3-5 (the node-side flash/verify/switch-back) is serialized per node: if two
 - Verification mismatch: `{"status": -99, "error": "flash verification failed: ..."}`
 - Success: `{"status": 0}`
 
-If the node-side step (3-5) fails; the flash command, the verification, or the mux switch-back; the service additionally marks the DUT as disabled (`metadata.enabled: false`), excluding it from new reservations; such a failure usually means a bad SD card or mux on that DUT. Existing reservations keep working. Re-enable it with `dut-control-admin dut-enable <dut-name>` (or `/conf/reload`) once fixed. Failures copying the image from the client (steps 1-2) do not disable the DUT.
+If the node-side step (3-5) fails; the flash command, the verification, or the mux switch-back; the service additionally marks the DUT as disabled (`metadata.enabled: false`), excluding it from new reservations; such a failure usually means a bad SD card or mux on that DUT. Existing reservations keep working until they end, but `/renew` no longer extends them. Re-enable it with `dut-control-admin dut-enable <dut-name>` (or `/conf/reload`) once fixed. Failures copying the image from the client (steps 1-2) do not disable the DUT.
 
 ### Wipe storage: /wipe
 
@@ -487,7 +517,7 @@ What the 128 MiB default reaches depends on the image layout. On the usual one i
 - Wipe pipeline failure: `{"status": -99, "error": "..."}`
 - Success: `{"status": 0}`
 
-As with `/flash`, a failure on the node marks the DUT as disabled: it usually means a bad SD card or mux. Re-enable it with `dut-control-admin dut-enable <dut-name>` once fixed.
+As with `/flash`, a failure on the node marks the DUT as disabled, so `/renew` no longer extends its reservation: it usually means a bad SD card or mux. Re-enable it with `dut-control-admin dut-enable <dut-name>` once fixed.
 
 ### DUT status: /dut/status
 
@@ -534,7 +564,7 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 - **`POST /conf/dut/enabled`**
   Enables or disables a DUT at runtime. Body: `dut-name` (string, required) and `enabled` (boolean, required), plus `admin-key`. Returns `{"result": 0, "dut-name": ..., "enabled": ...}` on success, `{"result": -1, "error": ...}` for a missing `dut-name` or non-boolean `enabled`, and `{"result": -2, "error": "dut not found"}` for an unknown DUT.
-  Disabled DUTs are excluded from pool lookups so they cannot be reserved; existing reservations keep working. The change is in-memory only: `/conf/reload` or a service restart reverts to the `enabled` value from the YAML configuration.
+  Disabled DUTs are excluded from pool lookups so they cannot be reserved; existing reservations keep working until they end, but `/renew` no longer extends them. The change is in-memory only: `/conf/reload` or a service restart reverts to the `enabled` value from the YAML configuration.
 
 ## CLI tools
 
