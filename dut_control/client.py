@@ -117,6 +117,19 @@ def _ssh_override_payload() -> Dict[str, Any]:
     return payload
 
 
+def _required_client_key(action: str) -> str:
+    """The client key, from the environment; exits naming the variable
+    and the action when it is not set."""
+    client_key = os.environ.get(CLIENT_KEY_ENV)
+    if not client_key:
+        print(
+            f"error: {CLIENT_KEY_ENV} not set; cannot {action}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return client_key
+
+
 def _required_token(args: argparse.Namespace) -> str:
     """
     The reservation token, from the argument or the environment.
@@ -171,13 +184,7 @@ def _print_error_and_exit(prefix: str, data: Dict[str, Any]) -> None:
 
 
 def cmd_pools(args: argparse.Namespace) -> None:
-    client_key = os.environ.get(CLIENT_KEY_ENV)
-    if not client_key:
-        print(
-            f"error: {CLIENT_KEY_ENV} not set; cannot list pools",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    client_key = _required_client_key("list pools")
 
     resp = requests.post(
         _full_url(args.url, "/pools"),
@@ -229,13 +236,7 @@ def _reserve(args: argparse.Namespace, payload: Dict[str, Any]) -> Dict:
 
 
 def cmd_reserve(args: argparse.Namespace) -> None:
-    client_key = os.environ.get(CLIENT_KEY_ENV)
-    if not client_key:
-        print(
-            f"error: {CLIENT_KEY_ENV} not set; cannot reserve",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    client_key = _required_client_key("reserve")
 
     payload = {"client-key": client_key, "pool": args.pool}
     payload.update(_ssh_override_payload())
@@ -262,13 +263,7 @@ def cmd_reserve(args: argparse.Namespace) -> None:
 
 
 def cmd_lease(args: argparse.Namespace) -> None:
-    client_key = os.environ.get(CLIENT_KEY_ENV)
-    if not client_key:
-        print(
-            f"error: {CLIENT_KEY_ENV} not set; cannot lease/release",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    client_key = _required_client_key("lease/release")
 
     base_url = args.url
     payload: Dict[str, Any] = {"client-key": client_key}
@@ -301,13 +296,7 @@ def cmd_lease(args: argparse.Namespace) -> None:
 
 
 def cmd_renew(args: argparse.Namespace) -> None:
-    client_key = os.environ.get(CLIENT_KEY_ENV)
-    if not client_key:
-        print(
-            f"error: {CLIENT_KEY_ENV} not set; cannot renew",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    client_key = _required_client_key("renew")
 
     payload = {"client-key": client_key, "token": _required_token(args)}
 
