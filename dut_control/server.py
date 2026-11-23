@@ -327,6 +327,12 @@ def _load_clients(config_dir: Path):
     return result
 
 
+def _conf_int(conf: dict, key: str, default: int) -> int:
+    """A positive number from conf.yml, else the default."""
+    value = int(conf.get(key) or 0)
+    return value if value > 0 else default
+
+
 def reload_config():
     """
     Reload admin_key, nodes, clients, and the upload and reserve
@@ -338,13 +344,13 @@ def reload_config():
     conf = _load_conf(CONFIG_DIR)
     new_nodes = _load_nodes(CONFIG_DIR)
     new_clients = _load_clients(CONFIG_DIR)
+    max_upload = _conf_int(conf, "max-upload-bytes", MAX_UPLOAD_BYTES)
+    max_lifetime = _conf_int(conf, "max-reserve-lifetime", 0)
 
     with state_lock:
         admin_key = conf["admin-key"]
-        server.config["MAX_CONTENT_LENGTH"] = int(
-            conf.get("max-upload-bytes", MAX_UPLOAD_BYTES))
-        server.config["MAX_RESERVE_LIFETIME"] = int(
-            conf.get("max-reserve-lifetime", 0))
+        server.config["MAX_CONTENT_LENGTH"] = max_upload
+        server.config["MAX_RESERVE_LIFETIME"] = max_lifetime
         nodes[:] = new_nodes
         clients[:] = new_clients
 
@@ -1595,7 +1601,7 @@ def _flash_named(node: dict, dut: dict, reserve_entry: dict):
 
 @server.errorhandler(413)
 def _upload_too_large(_):
-    limit = server.config.get("MAX_CONTENT_LENGTH") or MAX_UPLOAD_BYTES
+    limit = server.config["MAX_CONTENT_LENGTH"]
     return jsonify(
         {"status": -99,
          "error": f"upload is larger than the {limit} byte limit"}), 200
