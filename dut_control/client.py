@@ -300,6 +300,32 @@ def cmd_lease(args: argparse.Namespace) -> None:
         print("lease: ok")
 
 
+def cmd_renew(args: argparse.Namespace) -> None:
+    client_key = os.environ.get(CLIENT_KEY_ENV)
+    if not client_key:
+        print(
+            f"error: {CLIENT_KEY_ENV} not set; cannot renew",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    payload = {"client-key": client_key, "token": _required_token(args)}
+
+    resp = requests.post(
+        _full_url(args.url, "/renew"),
+        json=payload,
+        timeout=_timeout(args),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") != 0:
+        _print_error_and_exit("renew failed", data)
+
+    if not args.quiet:
+        print(f"valid-until: {data['valid-until']}")
+
+
 def cmd_power(args: argparse.Namespace) -> None:
     base_url = args.url
     payload = {"token": _required_token(args)}
@@ -546,6 +572,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not print anything on success",
     )
     sp_lease.set_defaults(func=cmd_lease)
+
+    # renew
+    sp_renew = sub.add_parser(
+        "renew",
+        help="Keep a reservation for longer, up to the lifetime the "
+             "service allows",
+    )
+    sp_renew.add_argument(
+        "token",
+        nargs="?",
+        help=f"Reservation token (default: ${TOKEN_ENV})",
+    )
+    sp_renew.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Do not print anything on success",
+    )
+    sp_renew.set_defaults(func=cmd_renew)
 
     # power
     sp_power = sub.add_parser(
