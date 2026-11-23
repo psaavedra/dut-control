@@ -533,6 +533,31 @@ def test_lease_release_by_token(flask_client, monkeypatch):
         assert server_mod.reserves[0]["valid-until"] <= int(time.time())
 
 
+def test_lease_ends_the_reservation_in_the_same_second(flask_client,
+                                                       monkeypatch):
+    client = _make_client()
+    node, dut = _make_node_dut(pool="pool-01")
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: 1_000_000)
+    monkeypatch.setattr(server_mod, "clients", [client])
+    monkeypatch.setattr(server_mod, "nodes", [node])
+    with server_mod.state_lock:
+        server_mod.reserves.append(
+            {
+                "token": "token-123",
+                "valid-from": 1_000_000 - 10,
+                "valid-until": 1_000_000 + 3600,
+                "client-key": client["key"],
+                "dut-name": dut["name"],
+            }
+        )
+    flask_client.post("/lease", json={"client-key": client["key"],
+                                      "token": "token-123"})
+
+    resp = flask_client.post("/dut/status", json={"token": "token-123"})
+
+    assert resp.get_json() == {"status": -2, "error": "token expired"}
+
+
 def test_lease_nothing_to_release(flask_client):
     client = _make_client()
     with server_mod.state_lock:
