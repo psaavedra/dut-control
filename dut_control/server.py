@@ -339,7 +339,7 @@ def reload_config():
     lifetime limits from YAML.
     Does NOT touch reserves/processes.
     """
-    global admin_key, nodes, clients
+    global admin_key
 
     conf = _load_conf(CONFIG_DIR)
     new_nodes = _load_nodes(CONFIG_DIR)
