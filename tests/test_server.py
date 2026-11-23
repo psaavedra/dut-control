@@ -573,6 +573,241 @@ def test_lease_nothing_to_release(flask_client):
 
 
 # ---------------------------------------------------------------------------
+# /renew endpoint
+# ---------------------------------------------------------------------------
+
+_NOW = 1_000_000
+
+
+def _renew_setup(monkeypatch, lifetime, valid_from=_NOW - 600,
+                 valid_until=_NOW + 600):
+    """One client, one DUT and one reservation of that client, at a
+    fixed now, with max-reserve-lifetime set to lifetime."""
+    client = _make_client()
+    node, dut = _make_node_dut(pool="pool-01")
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: _NOW)
+    monkeypatch.setitem(server_mod.server.config,
+                        "MAX_RESERVE_LIFETIME", lifetime)
+    # Own lists, restored after the test, as the tests change them.
+    monkeypatch.setattr(server_mod, "clients", [client])
+    monkeypatch.setattr(server_mod, "nodes", [node])
+    with server_mod.state_lock:
+        server_mod.reserves.append(
+            {
+                "token": "token-renew",
+                "valid-from": valid_from,
+                "valid-until": valid_until,
+                "client-key": client["key"],
+                "dut-name": dut["name"],
+            }
+        )
+    return client
+
+
+def _renew(flask_client, key, token="token-renew"):
+    resp = flask_client.post("/renew",
+                             json={"client-key": key, "token": token})
+    return resp.get_json()
+
+
+def test_renew_moves_the_end(flask_client, monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+
+    data = _renew(flask_client, client["key"])
+
+    until = _NOW + server_mod.RESERVE_SECONDS
+    assert data == {"status": 0, "valid-until": until}
+    assert server_mod.reserves[0]["valid-until"] == until
+
+
+def test_renew_stops_at_the_lifetime(flask_client, monkeypatch):
+    # The cap, valid-from plus the lifetime, is before now + 2 hours.
+    client = _renew_setup(monkeypatch, lifetime=9000,
+                          valid_from=_NOW - 3600)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": 0, "valid-until": _NOW - 3600 + 9000}
+
+
+def test_renew_refused_once_the_lifetime_is_reached(flask_client,
+                                                    monkeypatch):
+    # valid-from plus the lifetime is the current end already.
+    client = _renew_setup(monkeypatch, lifetime=7600,
+                          valid_from=_NOW - 7000)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -6, "error": "reservation lifetime reached"}
+    assert server_mod.reserves[0]["valid-until"] == _NOW + 600
+
+
+@pytest.mark.parametrize("lifetime", [0, server_mod.RESERVE_SECONDS])
+def test_renew_says_it_is_disabled_without_a_longer_lifetime(flask_client,
+                                                             monkeypatch,
+                                                             lifetime):
+    # Not set, or no longer than the first 2 hours of a reservation.
+    client = _renew_setup(monkeypatch, lifetime=lifetime)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -6, "error": "renew is disabled"}
+    assert server_mod.reserves[0]["valid-until"] == _NOW + 600
+
+
+def test_renew_right_after_reserve_keeps_the_end(flask_client, monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600, valid_from=_NOW,
+                          valid_until=_NOW + server_mod.RESERVE_SECONDS)
+
+    data = _renew(flask_client, client["key"])
+
+    until = _NOW + server_mod.RESERVE_SECONDS
+    assert data == {"status": 0, "valid-until": until}
+
+
+def test_renew_refuses_a_token_of_another_client(flask_client, monkeypatch):
+    _renew_setup(monkeypatch, lifetime=14 * 3600)
+    other = _make_client(name="client-02", key="client-key-02")
+    with server_mod.state_lock:
+        server_mod.clients.append(other)
+
+    data = _renew(flask_client, other["key"])
+
+    assert data["status"] == -1
+    assert server_mod.reserves[0]["valid-until"] == _NOW + 600
+
+
+def test_renew_refuses_a_reservation_whose_dut_is_gone(flask_client,
+                                                       monkeypatch):
+    # As power and flash do, e.g. after /conf/reload dropped the DUT.
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+    with server_mod.state_lock:
+        server_mod.nodes[:] = []
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -99, "error": "dut not found"}
+    assert server_mod.reserves[0]["valid-until"] == _NOW + 600
+
+
+def test_renew_refuses_a_disabled_dut(flask_client, monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+    server_mod.nodes[0]["duts"][0]["metadata"]["enabled"] = False
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -6,
+                    "error": "dut is disabled or not in an allowed pool"}
+    assert server_mod.reserves[0]["valid-until"] == _NOW + 600
+
+
+def test_renew_says_it_is_disabled_before_checking_the_dut(flask_client,
+                                                           monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=0)
+    server_mod.nodes[0]["duts"][0]["metadata"]["enabled"] = False
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -6, "error": "renew is disabled"}
+
+
+def test_renew_refuses_a_dut_whose_pool_the_client_lost(flask_client,
+                                                        monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+    client["allowed-pools"] = ["pool-02"]
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -6,
+                    "error": "dut is disabled or not in an allowed pool"}
+    assert server_mod.reserves[0]["valid-until"] == _NOW + 600
+
+
+def _end_after_validate_token(monkeypatch, end):
+    """Let validate_token find the reservation, then call end(entry)
+    before /renew looks it up again under the lock."""
+    lookup = server_mod._get_reserve_by_token
+    calls = []
+
+    def fake(token):
+        entry = lookup(token)
+        calls.append(token)
+        return end(entry) if len(calls) == 2 else entry
+
+    monkeypatch.setattr(server_mod, "_get_reserve_by_token", fake)
+
+
+def test_renew_rechecks_a_reservation_leased_meanwhile(flask_client,
+                                                       monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+
+    def lease(entry):
+        entry["valid-until"] = _NOW - 1
+        return entry
+    _end_after_validate_token(monkeypatch, lease)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -2, "error": "token expired"}
+    assert server_mod.reserves[0]["valid-until"] == _NOW - 1
+
+
+def test_renew_rechecks_a_reservation_leased_meanwhile_when_off(
+        flask_client, monkeypatch):
+    # The reservation is checked before whether renew is on.
+    client = _renew_setup(monkeypatch, lifetime=0)
+
+    def lease(entry):
+        entry["valid-until"] = _NOW - 1
+        return entry
+    _end_after_validate_token(monkeypatch, lease)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -2, "error": "token expired"}
+
+
+def test_renew_rechecks_a_reservation_pruned_meanwhile(flask_client,
+                                                       monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+    _end_after_validate_token(monkeypatch, lambda entry: None)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -2, "error": "token expired"}
+
+
+def test_renew_rechecks_a_dut_dropped_meanwhile(flask_client, monkeypatch):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+
+    def drop_dut(entry):
+        server_mod.nodes.clear()
+        return entry
+    _end_after_validate_token(monkeypatch, drop_dut)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -99, "error": "dut not found"}
+
+
+def test_renew_rechecks_a_client_reloaded_meanwhile(flask_client,
+                                                    monkeypatch):
+    # /conf/reload put a new client entry, without pool-01, in place of
+    # the one validate_client looked up.
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+
+    def reload(entry):
+        server_mod.clients[:] = [{**client, "allowed-pools": ["pool-02"]}]
+        return entry
+    _end_after_validate_token(monkeypatch, reload)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": -6,
+                    "error": "dut is disabled or not in an allowed pool"}
+
+
+# ---------------------------------------------------------------------------
 # /power endpoint
 # ---------------------------------------------------------------------------
 
