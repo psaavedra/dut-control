@@ -976,11 +976,11 @@ def _terminate_processes(tokens: set[str]):
 
 
 def _expire_reserves(tokens: set[str], now: float):
-    """Set valid-until to now for reserves."""
+    """End reserves: valid-until one second before now."""
     with state_lock:
         for r in reserves:
             if r.get("token") in tokens:
-                r["valid-until"] = now
+                r["valid-until"] = now - 1
 
 
 @server.route("/lease", methods=["POST", "PUT"])

@@ -359,7 +359,7 @@ Release reservations associated with a client.
 On success the service:
 
 - Kills SSH tunnel processes associated with the selected reservations
-- Sets `valid-until` to now for those reservations
+- Sets `valid-until` to one second before now for those reservations, so that no endpoint takes them as valid any more
 
 **Success response**:
 
