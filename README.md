@@ -570,13 +570,13 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 ### dut-control-client
 
-`dut-control-client` is a thin CLI wrapper around the main reservation, lease, power, flash, and status endpoints.
+`dut-control-client` is a thin CLI wrapper around the main reservation, lease, renew, power, flash, and status endpoints.
 
 **Environment**:
 
 - `DUT_CONTROL_URL` (optional): base URL of the service (default `http://localhost:8000`)
-- `DUT_CONTROL_CLIENT_KEY` (required for `reserve` and `lease`): client key matching configuration
-- `DUT_CONTROL_TOKEN` (optional): reservation token for `power`, `flash`, `status` and `lease`, used when none is given on the command line. Preferred over the positional argument on a shared host, where a token on a command line is readable in `ps` by every other user and ends up in any log that echoes the command
+- `DUT_CONTROL_CLIENT_KEY` (required for `reserve`, `lease` and `renew`): client key matching configuration
+- `DUT_CONTROL_TOKEN` (optional): reservation token for `power`, `flash`, `status`, `lease` and `renew`, used when none is given on the command line. Preferred over the positional argument on a shared host, where a token on a command line is readable in `ps` by every other user and ends up in any log that echoes the command
 - `DUT_CONTROL_CLIENT_SSH_IP` (optional): address the service must use to reach this host back, overriding the `ssh.ip` of its configuration entry
 - `DUT_CONTROL_CLIENT_SSH_PORT` (optional): port to use instead of the configured `ssh.port`
 
@@ -603,6 +603,9 @@ If the key does not match the configured `admin-key`, the service returns HTTP 4
 
 - **`lease [--token TOKEN | --pool POOL | --all] [-q|--quiet]`**
   Releases reservations for the current client, filtered by token or pool, or all; prints `lease: ok` on success unless `--quiet` is used. Given no filter at all, it releases the reservation named by `DUT_CONTROL_TOKEN` when that is set, and everything the client holds when it is not
+
+- **`renew [token] [-q|--quiet]`**
+  Calls `/renew` for the given token, or `DUT_CONTROL_TOKEN`, to keep the reservation until 2 hours from now, up to the `max-reserve-lifetime` of the service. Prints `valid-until: <seconds since the epoch>` on success unless `--quiet` is used, and fails with status 1 when the service refuses the renew, e.g. once the lifetime is reached
 
 - **`power <on|off|cycle> [token] [-q|--quiet]`**
   Calls `/power/<action>` for the given reservation token, or for `DUT_CONTROL_TOKEN`; prints `power: ok` on success unless `--quiet` is used
@@ -644,6 +647,9 @@ dut-control-client lease --all
 
 # Keep the token out of every later command line
 export DUT_CONTROL_TOKEN=$(dut-control-client reserve rpi5 --json | jq -r .token)
+
+# Keep it until 2 hours from now, for a long run (needs max-reserve-lifetime above 7200 on the service)
+dut-control-client renew
 
 # Power cycle a reserved DUT
 dut-control-client power cycle
