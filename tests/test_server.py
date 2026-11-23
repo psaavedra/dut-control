@@ -807,6 +807,56 @@ def test_renew_rechecks_a_client_reloaded_meanwhile(flask_client,
                     "error": "dut is disabled or not in an allowed pool"}
 
 
+def _reload_with(conf_text, tmp_path, monkeypatch):
+    """Run reload_config() on a conf.yml of conf_text, and return the
+    Flask config. What it overwrites is restored after the test."""
+    (tmp_path / "conf.yml").write_text(conf_text)
+    monkeypatch.setattr(server_mod, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(server_mod, "admin_key", server_mod.admin_key)
+    monkeypatch.setattr(server_mod, "nodes", [])
+    monkeypatch.setattr(server_mod, "clients", [])
+    config = server_mod.server.config
+    monkeypatch.setitem(config, "MAX_CONTENT_LENGTH", 1)
+    monkeypatch.setitem(config, "MAX_RESERVE_LIFETIME", 1)
+    server_mod.reload_config()
+    return config
+
+
+def test_reload_config_takes_empty_values_as_not_set(tmp_path, monkeypatch):
+    config = _reload_with(
+        "admin-key: k\nmax-upload-bytes:\nmax-reserve-lifetime:\n",
+        tmp_path, monkeypatch)
+
+    assert config["MAX_CONTENT_LENGTH"] == server_mod.MAX_UPLOAD_BYTES
+    assert config["MAX_RESERVE_LIFETIME"] == 0
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_reload_config_takes_a_non_positive_upload_limit_as_not_set(
+        tmp_path, monkeypatch, value):
+    # Flask applies it to every request body: 0 or less would refuse
+    # them all.
+    config = _reload_with(f"admin-key: k\nmax-upload-bytes: {value}\n",
+                          tmp_path, monkeypatch)
+
+    assert config["MAX_CONTENT_LENGTH"] == server_mod.MAX_UPLOAD_BYTES
+
+
+def test_reload_config_keeps_the_old_config_on_a_bad_value(
+        tmp_path, monkeypatch):
+    old_key = server_mod.admin_key
+
+    with pytest.raises(ValueError):
+        _reload_with("admin-key: new\nmax-reserve-lifetime: 14h\n",
+                     tmp_path, monkeypatch)
+
+    # _reload_with set both to 1 before the reload.
+    config = server_mod.server.config
+    assert server_mod.admin_key == old_key
+    assert config["MAX_CONTENT_LENGTH"] == 1
+    assert config["MAX_RESERVE_LIFETIME"] == 1
+
+
 # ---------------------------------------------------------------------------
 # /power endpoint
 # ---------------------------------------------------------------------------
