@@ -151,6 +151,7 @@ OK = {"status": 0}
     ["power", "on"],
     ["status"],
     ["flash", "/images/rpi5.wic"],
+    ["renew", "-q"],
 ])
 def test_a_subcommand_takes_the_token_from_the_environment(answers,
                                                            monkeypatch,
@@ -209,6 +210,27 @@ def test_lease_with_nothing_set_still_releases_everything(answers):
     client_mod.main(["lease"])
 
     assert "token" not in calls[0][1]
+
+
+def test_renew_sends_the_key_and_prints_the_new_end(answers, capsys):
+    calls = answers({"status": 0, "valid-until": 1767225600})
+
+    assert client_mod.main(["renew", "abc123"]) == 0
+
+    url, payload, _ = calls[0]
+    assert url.endswith("/renew")
+    assert payload == {"client-key": "a-client-key", "token": "abc123"}
+    assert capsys.readouterr().out == "valid-until: 1767225600\n"
+
+
+def test_renew_fails_when_the_lifetime_is_reached(answers, capsys):
+    answers({"status": -6, "error": "reservation lifetime reached"})
+
+    with pytest.raises(SystemExit) as exit_info:
+        client_mod.main(["renew", "abc123"])
+
+    assert exit_info.value.code == 1
+    assert "reservation lifetime reached" in capsys.readouterr().err
 
 
 BUSY = {"status": -4, "error": "no free duts for pool"}
