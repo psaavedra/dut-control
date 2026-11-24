@@ -1126,11 +1126,12 @@ def _account_policy(client: dict) -> accounting.Policy:
         recharge_hour_utc=accounting_conf["recharge-hour-utc"])
 
 
-def _reservation_price(pool: str) -> int:
-    """Millitokens for one reservation, by the pool asked for, not by
-    the other pools of the DUT, so the price is known in advance."""
+def _reservation_price(pool: str, minutes: int = RESERVATION_MINUTES):
+    """Millitokens for ``minutes`` of a reservation, one by default, by
+    the pool asked for, not by the other pools of the DUT, so the price
+    is known in advance."""
     return accounting.reservation_price(
-        RESERVATION_MINUTES, accounting_conf["token-minutes"],
+        minutes, accounting_conf["token-minutes"],
         accounting_conf["pool-costs"].get(pool, 1))
 
 
@@ -1239,15 +1240,15 @@ def _concurrency_problem(client: dict, account: str, pool: str, now: int):
     return None
 
 
-def _balance_problem(store, client: dict, account: str, pool: str,
-                     now: int):
-    """The balance does not cover one reservation in the pool."""
+def _balance_problem(store, client: dict, account: str, price: int,
+                     now: int, status: int = -6):
+    """The balance does not cover ``price``: -6 for a reservation, -7
+    for a renew, whose -6 means something else."""
     state = store.settle(account, _account_policy(client), now)
-    price = _reservation_price(pool)
     if state["balance"] >= price:
         return None
     tokens = accounting.to_tokens
-    return _QuotaProblem(-6, "quota_exceeded", "quota exceeded", **{
+    return _QuotaProblem(status, "quota_exceeded", "quota exceeded", **{
         "tokens-required": tokens(price),
         "tokens-available": tokens(state["balance"]),
         "next-recharge-at": state["next-recharge-at"],
@@ -1270,7 +1271,8 @@ def _quota_gate(client: dict, pool: str, now: int):
     problems = [p for p in (
         _rate_problem(client, account, now),
         _concurrency_problem(client, account, pool, now),
-        _balance_problem(store, client, account, pool, now)) if p]
+        _balance_problem(store, client, account,
+                         _reservation_price(pool), now)) if p]
     mode = _enforcement_mode(client)
     if problems and mode == "reject":
         return problems[0].response(), []
@@ -1516,9 +1518,43 @@ def renew():
         # Never earlier than the current end.
         until = max(reserve_entry["valid-until"],
                     min(now + RESERVE_SECONDS, cap))
+        refusal, fields = _charge_renew(client, reserve_entry, until, now)
+        if refusal is not None:
+            return refusal
         reserve_entry["valid-until"] = until
 
-    return jsonify({"status": 0, "valid-until": until}), 200
+    return jsonify({"status": 0, "valid-until": until, **fields}), 200
+
+
+def _charge_renew(client: dict, reserve_entry: dict, until: int, now: int):
+    """
+    Charge the minutes a renew adds past the end already paid, a
+    started minute as a whole one, at the price of the pool the
+    reservation was charged by. Returns the response to refuse it with,
+    or None, and the keys to add to the answer. Nothing to do with
+    accounting off, or for a reservation made while it was off.
+    """
+    store = accounting_store
+    token = reserve_entry["token"]
+    paid = store.paid_until(token) if store is not None else None
+    if paid is None or until <= paid["valid_until"]:
+        return None, {}
+    minutes = -(-(until - paid["valid_until"]) // 60)
+    price = _reservation_price(paid["pool"], minutes)
+    mode = _enforcement_mode(client)
+    problem = _balance_problem(store, client, paid["account_id"], price,
+                               now, status=-7)
+    if problem is not None and mode == "reject":
+        return problem.response(), {}
+    charge = store.extend(
+        paid["account_id"], _account_policy(client), now, token=token,
+        dut_name=reserve_entry["dut-name"], minutes=minutes, amount=price,
+        actor=client["name"])
+    fields = {"charged-tokens": accounting.to_tokens(charge["charged"]),
+              "tokens-available": accounting.to_tokens(charge["balance"])}
+    if problem is not None and mode == "warn":
+        fields["quota-warning"] = [problem.code]
+    return None, fields
 
 
 # ---------------------------------------------------------------------------
