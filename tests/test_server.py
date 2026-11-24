@@ -3634,3 +3634,96 @@ accounting:
 
     assert server_mod.admin_key == old_key
     assert not (tmp_path / "accounting.sqlite3").exists()
+
+
+# ---------------------------------------------------------------------------
+# Accounting of /renew
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def renew_clock(monkeypatch, accounting_on):
+    """client-01 holding a reservation of rpi5, at cost 2, made at t0
+    with renew allowed for 14 hours. Returns the client, its token and
+    a function that moves the clock to t0 plus some seconds."""
+    client = _one_shared_dut_setup()
+    _record_tunnels(monkeypatch)
+    monkeypatch.setitem(server_mod.server.config,
+                        "MAX_RESERVE_LIFETIME", 14 * 3600)
+    t0 = int(time.time())
+    clock = {"now": t0}
+    monkeypatch.setattr(server_mod, "_now_epoch", lambda: clock["now"])
+    token = _reserve_json(server_mod.server.test_client(), client)["token"]
+
+    def at(seconds):
+        clock["now"] = t0 + seconds
+
+    return client, token, at
+
+
+def test_renew_charges_the_added_time_and_lease_refunds_it(
+        flask_client, renew_clock, accounting_on):
+    client, token, at = renew_clock
+    at(3600)
+
+    data = _renew(flask_client, client["key"], token)
+
+    # One more hour at cost 2 is one token: 10 - 2 - 1.
+    assert (data["charged-tokens"], data["tokens-available"]) == (1.0, 7.0)
+    [extend] = accounting_on.history("client-01", kind="extend")
+    assert (extend["minutes"], extend["pool"]) == (60, "rpi5")
+
+    flask_client.post("/lease", json={"client-key": client["key"],
+                                      "token": token})
+    # 120 of the 180 paid minutes were left: 2 of the 3 tokens back.
+    [refund] = accounting_on.history("client-01", kind="refund")
+    assert refund["amount_millitokens"] == 2000
+
+
+def test_renew_pays_a_started_minute_once(flask_client, renew_clock,
+                                          accounting_on):
+    client, token, at = renew_clock
+
+    at(30)
+    first = _renew(flask_client, client["key"], token)
+    at(50)
+    second = _renew(flask_client, client["key"], token)
+
+    assert first["charged-tokens"] == round(2 / 120, 3)
+    assert second["status"] == 0 and "charged-tokens" not in second
+    assert len(accounting_on.history("client-01", kind="extend")) == 1
+
+
+@pytest.mark.parametrize("mode, status, warning", [
+    ("observe", 0, None),
+    ("warn", 0, ["quota_exceeded"]),
+    ("reject", -7, None),
+])
+def test_renew_short_of_tokens_by_enforcement_mode(
+        flask_client, renew_clock, accounting_on, mode, status, warning):
+    client, token, at = renew_clock
+    server_mod.accounting_conf["enforcement"] = mode
+    # 8 tokens left after the reservation; at cost 20, one more hour
+    # costs 10, which does not fit.
+    server_mod.accounting_conf["pool-costs"]["rpi5"] = 20
+    at(3600)
+    end = server_mod.reserves[0]["valid-until"]
+
+    data = _renew(flask_client, client["key"], token)
+
+    assert data["status"] == status
+    assert data.get("quota-warning") == warning
+    if status:
+        assert (data["error-code"], data["tokens-required"]) == (
+            "quota_exceeded", 10.0)
+        assert server_mod.reserves[0]["valid-until"] == end
+        assert accounting_on.history("client-01", kind="extend") == []
+
+
+def test_renew_of_a_reservation_made_before_accounting_is_free(
+        flask_client, monkeypatch, accounting_on):
+    client = _renew_setup(monkeypatch, lifetime=14 * 3600)
+
+    data = _renew(flask_client, client["key"])
+
+    assert data == {"status": 0,
+                    "valid-until": _NOW + server_mod.RESERVE_SECONDS}
