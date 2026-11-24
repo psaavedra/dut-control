@@ -522,12 +522,15 @@ On success, the service moves `valid-until` to 2 hours from now, but never past 
 { "status": 0, "valid-until": 1767225600 }
 ```
 
+With [accounting](#accounting) on, a renew pays for the minutes it adds past the end already paid, at the price of the pool the reservation was charged by; a started minute counts as a whole one, so two renews in the same minute pay once. The answer then adds `charged-tokens` and `tokens-available`, and `quota-warning` in `warn` mode when the balance did not cover it. The paid end moves with it, so `/lease` gives back the unused minutes of the whole reservation, renews included. A renew that adds nothing past the paid end, or of a reservation made while accounting was off, costs nothing. The ledger keeps each charge as an `extend` entry.
+
 **Error responses**:
 
 - `status = -1`: missing or invalid `client-key`, or a missing, unknown or other client's `token`
 - `status = -2`: the reservation already ended, or `/lease` released it
 - `status = -5`: invalid `client-ssh-ip` or `client-ssh-port`
 - `status = -6`: `reservation lifetime reached` once `max-reserve-lifetime` is used up; `renew is disabled` when it is not set or is 7200 or less; `dut is disabled or not in an allowed pool` when the DUT was disabled, by an admin or by the service after a failed `/flash` or `/wipe`, or no pool of the DUT is in the client's `allowed-pools` any more
+- `status = -7`, `error-code = quota_exceeded`: in `reject` mode, the balance does not cover the added minutes; it carries the same keys as a `-6` of `/reserve` (`tokens-required`, `tokens-available` and the next recharge), and the end does not move. It is not `-6`, which `/renew` already uses for the reasons above
 - `status = -99`: the DUT of the reservation is no longer in the configuration, as for `/power`
 
 ### Account: /account
@@ -576,7 +579,7 @@ The charges, refunds and recharges of the client's account, newest first.
 - **Request body**:
   - `client-key` (string, required)
   - `since`, `until` (integers, optional): only entries from `since` and before `until`, in epoch seconds
-  - `kind` (string, optional): only one kind of entry: `recharge`, `charge`, `refund`, `reserve-rollback` or `admin`
+  - `kind` (string, optional): only one kind of entry: `recharge`, `charge`, `extend`, `refund`, `reserve-rollback` or `admin`
   - `pool` (string, optional): only entries for that pool
   - `limit` (integer, optional): entries per page; 100 by default, 1000 at most
   - `before` (integer, optional): only entries older than this id, to read the next page
