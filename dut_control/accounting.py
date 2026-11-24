@@ -321,6 +321,56 @@ class AccountingStore:
             summary = self._summary(self._row(conn, account), policy, now)
             return dict(summary, charged=amount)
 
+    def paid_until(self, token: str):
+        """
+        The account, pool and paid end of a charged reservation that is
+        not released, or None: a reservation made with accounting off
+        was never charged.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT account_id, pool, valid_until FROM "
+                "reservation_charges WHERE reservation_token_hash = ? "
+                "AND released_at IS NULL",
+                (self.token_hash(token),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def extend(self, account: str, policy: Policy, now: int, *, token: str,
+               dut_name: str, minutes: int, amount: int,
+               actor: str) -> dict:
+        """
+        Charge ``minutes`` more of a reservation, as /renew moves its
+        end. The paid end moves by as much, so the refund on release
+        covers the whole time. Never refused here: the caller checks
+        the balance first.
+        """
+        token_hash = self.token_hash(token)
+        with self._transaction() as conn:
+            self._settle(conn, account, policy, now)
+            charge = conn.execute(
+                "SELECT * FROM reservation_charges "
+                "WHERE reservation_token_hash = ? AND released_at IS NULL",
+                (token_hash,)).fetchone()
+            if charge is None:
+                raise ValueError("reservation not charged")
+            until = charge["valid_until"] + minutes * 60
+            conn.execute(
+                "UPDATE reservation_charges SET charged_millitokens = "
+                "charged_millitokens + ?, reserved_minutes = "
+                "reserved_minutes + ?, valid_until = ? "
+                "WHERE reservation_token_hash = ?",
+                (amount, minutes, until, token_hash))
+            self._entry(conn, f"extend:{token_hash}:{until}", now, account,
+                        "extend", -amount,
+                        reservation_token_hash=token_hash,
+                        pool=charge["pool"], dut_name=dut_name,
+                        minutes=minutes, actor=actor)
+            summary = self._summary(self._row(conn, account), policy, now)
+            return dict(summary, charged=amount)
+
     def _give_back(self, token: str, now: int, kind: str, whole: bool):
         token_hash = self.token_hash(token)
         with self._transaction() as conn:
