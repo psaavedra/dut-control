@@ -191,3 +191,18 @@ def test_report_adds_up_by_account_pool_and_kind(store):
     assert [(r["kind"], r["entries"], r["amount"], r["minutes"])
             for r in rows] == [("charge", 2, -4 * MILLI, 240),
                                ("refund", 1, 2 * MILLI, 0)]
+
+
+def test_extend_moves_the_paid_end_for_the_refund(store):
+    now = _ts(2026, 6, 3)
+    _charge(store, now)
+    paid = store.paid_until("t1")
+
+    store.extend("team", POLICY, now, token="t1", dut_name="rpi5-01",
+                 minutes=60, amount=MILLI, actor="client-01")
+
+    assert store.paid_until("t1")["valid_until"] == \
+        paid["valid_until"] + 3600
+    # Released at once: all 180 paid minutes, all 3 tokens, come back.
+    assert store.refund("t1", now) == 3 * MILLI
+    assert store.paid_until("t1") is None
